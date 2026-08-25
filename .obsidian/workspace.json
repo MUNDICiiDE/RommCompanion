@@ -13,12 +13,12 @@
             "state": {
               "type": "markdown",
               "state": {
-                "file": "docs/romm-companion-plan.md",
-                "mode": "source",
+                "file": "docs/romm-companion-feature-specs.md",
+                "mode": "preview",
                 "source": false
               },
               "icon": "lucide-file",
-              "title": "romm-companion-plan"
+              "title": "romm-companion-feature-specs"
             }
           }
         ]
@@ -99,7 +99,7 @@
             "state": {
               "type": "backlink",
               "state": {
-                "file": "docs/romm-companion-plan.md",
+                "file": "docs/romm-companion-feature-specs.md",
                 "collapseAll": false,
                 "extraContext": false,
                 "sortOrder": "alphabetical",
@@ -118,7 +118,7 @@
             "state": {
               "type": "outgoing-link",
               "state": {
-                "file": "docs/romm-companion-plan.md",
+                "file": "docs/romm-companion-feature-specs.md",
                 "linksCollapsed": false,
                 "unlinkedCollapsed": true
               },
@@ -161,7 +161,7 @@
             "state": {
               "type": "outline",
               "state": {
-                "file": "docs/romm-companion-plan.md",
+                "file": "docs/romm-companion-feature-specs.md",
                 "followCursor": false,
                 "showSearch": false,
                 "searchQuery": ""
@@ -190,9 +190,10 @@
   },
   "active": "594656c5aef711ad",
   "lastOpenFiles": [
+    "docs/romm-companion-plan.md",
+    "docs/romm-companion-feature-specs.md",
     "RommCompanion/LICENSE",
     "RommCompanion",
-    "docs/romm-companion-plan.md",
     "docs"
   ]
 }
