@@ -1,3 +1,5 @@
+<!-- markdownlint-disable MD013 -->
+
 # RomM Companion v1 Master Plan
 
 > **Status:** Approved and authoritative for v1. Implementation details must conform to this document. See the [detailed feature specification](./romm-companion-feature-specs.md) for feature-level behavior and acceptance criteria.
