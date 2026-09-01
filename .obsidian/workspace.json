@@ -190,10 +190,29 @@
   },
   "active": "594656c5aef711ad",
   "lastOpenFiles": [
+    "target/debug/deps/rustci8QlFB/symbols.o",
+    "target/debug/deps/rustci8QlFB/linker-arguments",
+    "target/debug/deps/rustci8QlFB",
+    "target/debug/incremental/romm_core-2hdar48i8v7j1/s-hlw0bdh58i-0hhflcr-9he98mrfmtnp3hvxpzi9brv1p/work-products.bin",
+    "target/debug/incremental/romm_core-2hdar48i8v7j1/s-hlw0bdh58i-0hhflcr-9he98mrfmtnp3hvxpzi9brv1p/f30q028e70ukrkut7llw1dsp6.o",
+    "target/debug/incremental/romm_core-2hdar48i8v7j1/s-hlw0bdh58i-0hhflcr-9he98mrfmtnp3hvxpzi9brv1p/query-cache.bin",
+    "target/debug/incremental/romm_core-2hdar48i8v7j1/s-hlw0bdh58i-0hhflcr-9he98mrfmtnp3hvxpzi9brv1p/f4hf59034xxncu6r8n1ig40n2.o",
+    "target/debug/incremental/romm_core-2hdar48i8v7j1/s-hlw0bdh58i-0hhflcr-9he98mrfmtnp3hvxpzi9brv1p/f1cr6y8wp07lfmig8tiuhtmle.o",
+    "target/debug/incremental/romm_core-2hdar48i8v7j1/s-hlw0bdh58i-0hhflcr-9he98mrfmtnp3hvxpzi9brv1p/f0xu8p6hujks5x27xpnus6f2k.o",
+    "target/debug/incremental/romm_core-2hdar48i8v7j1/s-hlw0bdh58i-0hhflcr-9he98mrfmtnp3hvxpzi9brv1p/exmgeavgi5pugifrgqdg77alo.o",
+    "target/debug/incremental/romm_core-2hdar48i8v7j1/s-hlw0bdh58i-0hhflcr-9he98mrfmtnp3hvxpzi9brv1p/ezsdnbbyb98v9cfj5n6dvtyjs.o",
     "docs/romm-companion-plan.md",
     "docs/romm-companion-feature-specs.md",
-    "RommCompanion/LICENSE",
-    "RommCompanion",
-    "docs"
+    "README.md",
+    "apps/desktop/src-tauri/icons/android/mipmap-xxxhdpi/ic_launcher.png",
+    "apps/desktop/src-tauri/icons/android/mipmap-xxxhdpi/ic_launcher_round.png",
+    "apps/desktop/src-tauri/icons/android/mipmap-xxhdpi/ic_launcher.png",
+    "apps/desktop/src-tauri/icons/android/mipmap-xxhdpi/ic_launcher_round.png",
+    "apps/desktop/src-tauri/icons/android/mipmap-xhdpi/ic_launcher.png",
+    "apps/desktop/src-tauri/icons/android/mipmap-xhdpi/ic_launcher_round.png",
+    "apps/desktop/src-tauri/icons/android/mipmap-mdpi/ic_launcher.png",
+    "apps/desktop/src-tauri/icons/android/mipmap-mdpi/ic_launcher_round.png",
+    "apps/desktop/src-tauri/icons/android/mipmap-hdpi/ic_launcher.png",
+    "apps/desktop/src-tauri/icons/android/mipmap-hdpi/ic_launcher_round.png"
   ]
 }

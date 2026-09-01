@@ -1,0 +1,32 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "RomM Companion",
+  "version": "0.1.0",
+  "identifier": "app.romm-companion.desktop",
+  "build": {
+    "beforeDevCommand": "pnpm dev:web",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "pnpm build:web",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "RomM Companion",
+        "width": 1280,
+        "height": 800,
+        "minWidth": 800,
+        "minHeight": 600,
+        "resizable": true
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; connect-src ipc: http://ipc.localhost; img-src 'self' asset: http://asset.localhost data:; style-src 'self' 'unsafe-inline'"
+    }
+  },
+  "bundle": {
+    "active": false
+  }
+}
+

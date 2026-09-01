@@ -18,3 +18,15 @@ target/
 #.idea/
 /.obsidian
 .obsidian/workspace.json
+
+# JavaScript and Tauri build output
+node_modules/
+dist/
+*.log
+.pnpm-store/
+
+# Local environment and generated credentials
+.env
+.env.*
+!.env.example
+.obsidian/workspace.json

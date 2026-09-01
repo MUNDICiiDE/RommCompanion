@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-labelledby="title">
+  <title id="title">RomM Companion</title>
+  <defs>
+    <linearGradient id="background" x1="76" y1="40" x2="446" y2="472" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#8B6CFF"/>
+      <stop offset="1" stop-color="#4B32B7"/>
+    </linearGradient>
+    <linearGradient id="accent" x1="117" y1="146" x2="410" y2="374" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#B9FFEE"/>
+      <stop offset="1" stop-color="#62E8C8"/>
+    </linearGradient>
+  </defs>
+  <rect width="512" height="512" rx="116" fill="#090C14"/>
+  <rect x="28" y="28" width="456" height="456" rx="96" fill="url(#background)"/>
+  <path d="M132 166c0-23.2 18.8-42 42-42h104c65.2 0 118 52.8 118 118 0 46.1-26.4 86-65 105.5L397 420h-91l-58-64h-34v64h-82V166Zm82 34v80h60c22.1 0 40-17.9 40-40s-17.9-40-40-40h-60Z" fill="#0A0D16"/>
+  <path d="M174 124h104c65.2 0 118 52.8 118 118 0 46.1-26.4 86-65 105.5" fill="none" stroke="url(#accent)" stroke-width="22" stroke-linecap="round"/>
+  <circle cx="376" cy="151" r="18" fill="#B9FFEE"/>
+</svg>

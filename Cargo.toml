@@ -1,0 +1,38 @@
+[workspace]
+members = [
+  "apps/desktop/src-tauri",
+  "crates/romm-core",
+  "crates/romm-ipc",
+  "crates/romm-sync-agent",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+rust-version = "1.88"
+
+[workspace.dependencies]
+anyhow = "1"
+base64 = "0.22"
+fs2 = "0.4"
+gilrs = "0.11"
+keyring = { version = "3.6.3", default-features = false }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+romm-core = { path = "crates/romm-core" }
+romm-ipc = { path = "crates/romm-ipc" }
+rusqlite = { version = "0.37", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tauri = { version = "2", features = ["tray-icon"] }
+tauri-build = { version = "2" }
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+url = "2"
+uuid = { version = "1", features = ["v4"] }
+x509-parser = "0.18"
+
+[workspace.dependencies.tempfile]
+version = "3"

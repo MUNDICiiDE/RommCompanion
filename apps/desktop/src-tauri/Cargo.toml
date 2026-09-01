@@ -1,0 +1,21 @@
+[package]
+name = "romm-companion-desktop"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "romm_companion_desktop_lib"
+crate-type = ["lib", "cdylib", "staticlib"]
+
+[build-dependencies]
+tauri-build.workspace = true
+
+[dependencies]
+gilrs.workspace = true
+romm-ipc.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tauri.workspace = true
+tokio.workspace = true

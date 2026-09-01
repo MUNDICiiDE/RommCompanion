@@ -1,0 +1,31 @@
+[package]
+name = "romm-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+base64.workspace = true
+reqwest.workspace = true
+romm-ipc.workspace = true
+rusqlite.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+url.workspace = true
+uuid.workspace = true
+x509-parser.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+keyring = { workspace = true, features = ["windows-native"] }
+windows-sys = { version = "0.60", features = ["Win32_Foundation", "Win32_System_Threading"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+fs2.workspace = true
+keyring = { workspace = true, features = ["sync-secret-service", "vendored"] }
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio.workspace = true

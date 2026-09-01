@@ -1,0 +1,12 @@
+{
+  "name": "romm-companion-workspace",
+  "version": "0.1.0",
+  "private": true,
+  "packageManager": "pnpm@11.19.0",
+  "scripts": {
+    "build": "cargo build --release -p romm-sync-agent && pnpm --filter @romm-companion/desktop build",
+    "check": "pnpm --filter @romm-companion/desktop check",
+    "dev": "cargo build -p romm-sync-agent && pnpm --filter @romm-companion/desktop tauri dev",
+    "test": "pnpm --filter @romm-companion/desktop test"
+  }
+}

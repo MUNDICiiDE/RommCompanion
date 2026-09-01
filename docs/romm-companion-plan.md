@@ -2,20 +2,22 @@
 
 # RomM Companion v1 Master Plan
 
-> **Status:** Approved and authoritative for v1. Implementation details must conform to this document. See the [detailed feature specification](./romm-companion-feature-specs.md) for feature-level behavior and acceptance criteria.
+> **Status:** Approved and authoritative for v1. Implementation details must conform to this document. See the [[romm-companion-feature-specs|detailed feature specification]] for feature-level behavior and acceptance criteria.
+> **Implementation tracking:** Work is divided into small, independently verifiable milestones in the [[#Delivery roadmap|delivery roadmap]]. Detailed checklists live in the [[romm-companion-feature-specs|feature specification]]. Update both documents whenever a milestone changes state.
 
 ## Table of contents
 
-- [Product definition](#product-definition)
-- [Technology choices](#technology-choices)
-- [Architecture and interfaces](#architecture-and-interfaces)
-- [Product behavior](#product-behavior)
-- [Distribution and operations](#distribution-and-operations)
-- [Quality and release criteria](#quality-and-release-criteria)
-- [Security and privacy](#security-and-privacy)
-- [v1 boundaries](#v1-boundaries)
-- [Assumptions and defaults](#assumptions-and-defaults)
-- [References](#references)
+- [[#Product definition|Product definition]]
+- [[#Delivery roadmap|Delivery roadmap]]
+- [[#Technology choices|Technology choices]]
+- [[#Architecture and interfaces|Architecture and interfaces]]
+- [[#Product behavior|Product behavior]]
+- [[#Distribution and operations|Distribution and operations]]
+- [[#Quality and release criteria|Quality and release criteria]]
+- [[#Security and privacy|Security and privacy]]
+- [[#v1 boundaries|v1 boundaries]]
+- [[#Assumptions and defaults|Assumptions and defaults]]
+- [[#References|References]]
 
 ## Product definition
 
@@ -31,6 +33,31 @@ The app lets a user:
 - Operate the entire interface with a controller, while retaining keyboard, mouse, and touch support.
 
 RomM Companion prepares files for EmuDeck, ES-DE, Steam ROM Manager, or another external frontend. It does not launch emulators or maintain external frontend databases.
+
+## Delivery roadmap
+
+Status meanings: **Complete** has passed its milestone acceptance checks; **In progress** has verified implementation but unfinished acceptance checks; **Not started** has no accepted implementation yet; **Continuous** runs throughout development and is only complete for a release candidate.
+
+| Feature | Small milestones | Status | Next action |
+| --- | --- | --- | --- |
+| 1. Application foundation | 1.1 workspace, 1.2 IPC/agent, 1.3 persistence, 1.4 desktop lifecycle, 1.5 foundation validation | Complete | Maintain while later features extend it |
+| 2. Server connection and pairing | 2.1 probing, 2.2 trust controls, 2.3 pairing/manual token, 2.4 validation/persistence, 2.5 recovery/UI, 2.6 validation | Complete | Maintain against supported RomM 5.x releases |
+| 3. Device registration | 3.1 API/local model, 3.2 registration, 3.3 onboarding UI, 3.4 verification/recovery, 3.5 settings/validation | Complete | Maintain while mappings and sync extend the device payload |
+| 4. Controller and spatial navigation | 4.1 native input, 4.2 focus graph, 4.3 action model, 4.4 text entry, 4.5 accessibility/automation, 4.6 physical qualification | In progress | Defer the 4.6 hardware gate; active development continues at Feature 6 |
+| 5. Onboarding | 5.1 state machine, 5.2 connection/device steps, 5.3 mapping/archive steps, 5.4 agent/update choices, 5.5 resume/validation | Complete | Maintain the completed handoff while library/cache contracts expand |
+| 6. Library browsing | 6.1 API/cache model, 6.2 paged catalog, 6.3 shelves/views, 6.4 search/filter/details, 6.5 offline/error/validation | In progress | Build 6.5 stale/error/artwork handling and complete library performance validation |
+| 7. Favorites | 7.1 model/API, 7.2 optimistic UI, 7.3 offline journal, 7.4 reconciliation/validation | Not started | Begin after library cache contracts stabilize |
+| 8. EmuDeck detection and mappings | 8.1 platform catalog, 8.2 detection, 8.3 mapping editor, 8.4 validation/removable storage, 8.5 persistence/validation | In progress | Complete directory browsing/creation and removable-storage safety in 8.3-8.5 |
+| 9. Download queue | 9.1 queue model, 9.2 transfer engine, 9.3 controls/concurrency, 9.4 recovery, 9.5 UI/validation | Not started | Begin after mappings provide safe destinations |
+| 10. Archive processing and local copies | 10.1 policy model, 10.2 safe extraction, 10.3 finalization, 10.4 managed removal, 10.5 validation | Not started | Begin after the base download engine |
+| 11. Offline mode and local cache | 11.1 metadata cache, 11.2 artwork LRU, 11.3 offline UX/search, 11.4 reconnect/reset, 11.5 validation | In progress | Extend the 6.1 metadata/page foundation with artwork LRU, offline search, and recovery controls |
+| 12. Background sync agent | 12.1 foreground lifecycle, 12.2 service controls, 12.3 Windows startup, 12.4 SteamOS systemd, 12.5 health/update/validation | In progress | Validate 5.4 registration on Windows and later qualify the SteamOS user service physically |
+| 13. Save and state synchronization | 13.1 mappings/inventory, 13.2 watching/stability, 13.3 protocol engine, 13.4 reconciliation, 13.5 conflicts, 13.6 validation | Not started | Begin after mappings and device registration |
+| 14. Settings and diagnostics | 14.1 settings model/UI, 14.2 staged application, 14.3 diagnostics preview, 14.4 redacted export, 14.5 validation | Not started | Add incrementally as feature settings become available |
+| 15. Updates and distribution | 15.1 release versioning, 15.2 Windows packaging, 15.3 AppImage/sidecar, 15.4 signed updater, 15.5 rollback/docs/validation | Not started | Defer packaging completion until core features stabilize |
+| 16. Cross-cutting test matrix | 16.1 fixtures/harnesses, 16.2 CI, 16.3 security/data integrity, 16.4 performance/resilience, 16.5 physical release qualification | Continuous | Extend coverage with every completed milestone |
+
+The milestone checkboxes and completion evidence are maintained in the [[romm-companion-feature-specs|detailed feature specification]]. A parent feature is complete only when every milestone under it is checked and its feature-level acceptance criteria pass.
 
 ## Technology choices
 
@@ -87,6 +114,10 @@ The Tauri GUI is a control and presentation client. It sends typed requests over
 
 When background operation is disabled, the GUI starts an ephemeral agent and terminates it after pending database writes are flushed. Downloads pause safely when that agent exits. When background operation is enabled, the GUI connects to the registered user-level agent and downloads/sync continue after the window closes.
 
+Window-close behavior is an explicit persisted desktop preference. The default is **Minimize to tray**, which hides the GUI while leaving its foreground agent available; **Quit completely** gracefully stops a GUI-owned ephemeral agent and exits. The tray menu always provides **Open RomM Companion** and **Quit completely**. On SteamOS Gaming Mode, where no conventional tray is available, an enabled user-level agent continues independently and the GUI reconnects when reopened.
+
+A controller-focusable fullscreen toggle is always available near the top of the GUI and the preference persists. Windows and general Linux installations default to windowed mode. Steam Deck hardware defaults to fullscreen on first launch, detected from Valve/Jupiter/Galileo DMI data with SteamOS environment and `VARIANT_ID=steamdeck` fallbacks; the user can override it permanently.
+
 ### Local IPC
 
 - Linux: Unix domain socket below `$XDG_RUNTIME_DIR`, with user-only permissions.
@@ -110,7 +141,7 @@ The Rust boundary publishes serialized equivalents of:
 - `AppSettings`
 - `AppError`
 
-The detailed field definitions and command/event contracts live in the [feature specification](./romm-companion-feature-specs.md).
+The detailed field definitions and command/event contracts live in the [[romm-companion-feature-specs|feature specification]].
 
 ### RomM compatibility and authentication
 
@@ -118,12 +149,13 @@ The detailed field definitions and command/event contracts live in the [feature 
 - Generate models from a pinned RomM 5.x OpenAPI snapshot and accept unknown additive response fields.
 - Probe `/openapi.json` and authenticated identity/capability endpoints during setup.
 - Reject an incompatible server before creating local mappings or a device record.
-- Prefer the eight-digit, five-minute, single-use pairing-code exchange.
+- Prefer the eight-character alphanumeric, five-minute, single-use pairing-code exchange (`XXXX-XXXX`).
 - Allow manual `rmm_...` Client API Token entry as a fallback.
 - Never collect or persist a RomM account password.
 
 Request only these scopes:
 
+- `me.read`
 - `roms.read`
 - `platforms.read`
 - `collections.read`
@@ -133,6 +165,8 @@ Request only these scopes:
 - `assets.write`
 - `devices.read`
 - `devices.write`
+
+`me.read` is required to verify the authenticated account and inspect the current user's Client API Tokens. The app deliberately does not request `me.write`: signing out clears the local credential and identifies the RomM token for optional revocation in RomM's web interface.
 
 Tokens are kept in Windows Credential Manager or Linux Secret Service. If Linux Secret Service is unavailable, the user may explicitly accept storage in a user-only `0600` credential file. The fallback is never silent.
 
@@ -158,6 +192,8 @@ HTTP is allowed only after a visible warning. Invalid TLS certificates cannot be
 The default presentation is a media-library layout with large cover art, horizontal shelves, high-contrast focus rings, and a compact game-detail surface. Home exposes recent additions, favorites, platforms, collections, downloaded games, and active downloads.
 
 All functionality is reachable through controller, keyboard, mouse, and touch. Directional focus is deterministic and restored when dialogs close or virtualized lists update. Motion honors the operating-system reduced-motion preference.
+
+Library API reads use stable, offset-based pages of 48 ROMs. The first page renders immediately, progress is shown as `loaded of total`, and another page is requested within 600 CSS pixels of the scroll end. A controller-focusable **Load more games** action remains available whenever another page exists. Refresh restarts at offset zero and overlapping pages are deduplicated by RomM ROM ID. IPC schema v17 defines typed all, recent, favorite, platform, standard/smart collection, downloaded, and active-download queries plus combinable search, platform, collection, favorite, downloaded, and sort fields and complete game-detail requests. Home and six controller-accessible tabs expose those views; downloaded-only queries never contact RomM. Online discovery translates to RomM's `search_term`, platform, collection, favorite, and ordering parameters; retryable failures immediately query the normalized local cache. The agent persists normalized origin-scoped ROM, user-ROM, artwork, platform, collection, local-state, view-scoped exact-page, and full-detail records in SQLite schema v10. Every remote page, detail record, and metadata snapshot reports live/cache source, refresh time, and 24-hour stale state; only retryable connection/server failures may use remote-cache fallback. Favorite mutation and downloads remain owned by Features 7 and 9.
 
 ### Downloads and local files
 
@@ -191,6 +227,7 @@ Metadata, collections, favorite state, mappings, queue state, and local-file ass
 ## Distribution and operations
 
 - Publish a Windows NSIS installer and x86-64 Linux AppImage through GitHub Releases.
+- At the final distribution milestone, package `romm-sync-agent` with Tauri `bundle.externalBin` as a target-triple-specific sidecar. Users receive one NSIS installer or one AppImage and never manage the agent executable separately.
 - Build AppImage artifacts against an Ubuntu 22.04-compatible baseline.
 - Include a desktop entry and instructions for adding the AppImage as a non-Steam game.
 - Do not create or modify Steam shortcuts automatically.
