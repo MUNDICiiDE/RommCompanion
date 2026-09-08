@@ -1,16 +1,24 @@
-use std::sync::{Arc, Mutex};
+use std::{
+    fs,
+    path::Path,
+    sync::{Arc, Mutex},
+};
 
 use anyhow::{Context, Result};
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use romm_core::{
-    RommSession, ValidatedAuth,
+    MAX_ARTWORK_BYTES, RommSession, ValidatedAuth,
     credentials::SystemCredentialStore,
     decode_certificate_payload,
     device::{
         apply_registration, apply_verification, clear_remote_registration, mark_device_missing,
         mark_device_permission_error, propose_device_identity, with_display_name,
     },
+    image_mime_type,
     mapping::{
-        detect_platform_mappings, validate_mapping_drafts, validate_mapping_drafts_for_review,
+        browse_mapping_directories, create_mapping_directory, detect_platform_mappings,
+        merge_mapping_detection, recheck_mapping_drafts, validate_mapping_drafts,
+        validate_mapping_drafts_for_review,
     },
     normalize_base_url,
     onboarding::{
@@ -19,19 +27,25 @@ use romm_core::{
         select_onboarding_server, validate_onboarding_state,
     },
     server_origin,
-    storage::{AgentLock, AppPaths, Database, StoredServerProfile},
+    storage::{
+        AgentLock, AppPaths, CacheEntryRecord, DEFAULT_ARTWORK_CACHE_BUDGET_BYTES, Database,
+        StoredServerProfile,
+    },
 };
 use romm_ipc::{
-    AgentRequest, AgentResponse, AgentStatus, AppError, AppSettings, AuthResult,
-    BackgroundSetupResult, CaImportResult, ConnectionState, DeviceRegistrationState,
-    DeviceRemovalOutcome, DeviceRemovalResult, DeviceVerificationOutcome, IPC_SCHEMA_VERSION,
-    InitialRefreshResult, OnboardingState, OnboardingStep, PlatformMappingDraft, REQUIRED_SCOPES,
-    RequestEnvelope, ResponseEnvelope, local_ipc_endpoint,
+    AgentRequest, AgentResponse, AgentStatus, AppError, AppSettings, ArtworkKind, ArtworkPayload,
+    ArtworkReference, AuthResult, BackgroundSetupResult, CaImportResult, ConnectionState,
+    DeviceRegistrationState, DeviceRemovalOutcome, DeviceRemovalResult, DeviceVerificationOutcome,
+    FavoriteReconciliationOutcome, FavoriteReconciliationResult, FavoriteReconciliationStatus,
+    IPC_SCHEMA_VERSION, InitialRefreshResult, OnboardingState, OnboardingStep,
+    PlatformMappingDraft, REQUIRED_SCOPES, RequestEnvelope, ResponseEnvelope, local_ipc_endpoint,
 };
+use sha2::{Digest, Sha256};
 use tokio::{
     io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader},
-    sync::{Mutex as AsyncMutex, RwLock, watch},
+    sync::{Mutex as AsyncMutex, RwLock, Semaphore, watch},
 };
+use uuid::Uuid;
 
 mod background;
 mod logging;
@@ -46,6 +60,7 @@ struct AgentState {
     paths: AppPaths,
     device_registration: AsyncMutex<()>,
     library_request: AsyncMutex<()>,
+    artwork_requests: Semaphore,
     onboarding: AsyncMutex<OnboardingState>,
     background_configurer: fn(bool) -> Result<background::RegistrationOutcome, String>,
 }
@@ -117,11 +132,16 @@ async fn main() -> Result<()> {
         paths,
         device_registration: AsyncMutex::new(()),
         library_request: AsyncMutex::new(()),
+        artwork_requests: Semaphore::new(4),
         onboarding: AsyncMutex::new(onboarding),
         background_configurer: background::configure,
     });
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     tokio::spawn(checkpoint_daily(Arc::clone(&state), shutdown_rx.clone()));
+    tokio::spawn(monitor_mapping_health(
+        Arc::clone(&state),
+        shutdown_rx.clone(),
+    ));
     let result = serve(Arc::clone(&state), shutdown_tx, shutdown_rx).await;
     if let Ok(database) = state.database.lock() {
         let _ = database.checkpoint();
@@ -140,6 +160,46 @@ async fn checkpoint_daily(state: Arc<AgentState>, mut shutdown: watch::Receiver<
                     && let Err(error) = database.checkpoint()
                 {
                     logging::error("database_checkpoint_failed", &error.to_string());
+                }
+            }
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    break;
+                }
+            }
+        }
+    }
+}
+
+async fn monitor_mapping_health(state: Arc<AgentState>, mut shutdown: watch::Receiver<bool>) {
+    let mut interval = tokio::time::interval(std::time::Duration::from_secs(15));
+    loop {
+        tokio::select! {
+            _ = interval.tick() => {
+                let Some(origin) = state.session.read().await.server_origin() else {
+                    continue;
+                };
+                let drafts = state.database.lock().ok().and_then(|database| {
+                    database.has_mapping_outcome(&origin).ok().filter(|accepted| *accepted)?;
+                    database.load_platform_mappings(&origin).ok()
+                });
+                let Some(drafts) = drafts else {
+                    continue;
+                };
+                let enabled = drafts.iter().any(|draft| draft.enabled);
+                if !enabled {
+                    continue;
+                }
+                let checked_drafts = drafts.clone();
+                let Ok(result) = tokio::task::spawn_blocking(move || {
+                    recheck_mapping_drafts(&checked_drafts, false)
+                }).await else {
+                    continue;
+                };
+                if let Ok(database) = state.database.lock()
+                    && let Err(error) = database.update_mapping_validation_statuses(&origin, &result)
+                {
+                    logging::error("mapping_health_save_failed", &error.to_string());
                 }
             }
             changed = shutdown.changed() => {
@@ -319,6 +379,16 @@ async fn dispatch(request: AgentRequest, state: Arc<AgentState>) -> AgentRespons
                 .lock()
                 .ok()
                 .and_then(|database| database.load_device().ok().flatten());
+            let pending_favorite_count = session
+                .server_origin()
+                .and_then(|origin| {
+                    state
+                        .database
+                        .lock()
+                        .ok()
+                        .and_then(|database| database.pending_favorite_count(&origin).ok())
+                })
+                .unwrap_or(0);
             AgentResponse::Status {
                 status: Box::new(AgentStatus {
                     version: env!("CARGO_PKG_VERSION").to_owned(),
@@ -337,6 +407,7 @@ async fn dispatch(request: AgentRequest, state: Arc<AgentState>) -> AgentRespons
                     ca_id: session.ca_id(),
                     http_approved: session.http_approved(),
                     device,
+                    pending_favorite_count,
                 }),
             }
         }
@@ -783,8 +854,48 @@ async fn dispatch(request: AgentRequest, state: Arc<AgentState>) -> AgentRespons
                 Ok(platforms) => {
                     state.session.write().await.mark_contact();
                     *state.connection.write().await = ConnectionState::Connected;
+                    let origin = state.session.read().await.server_origin();
+                    let existing = if let Some(origin) = origin {
+                        let Ok(database) = state.database.lock() else {
+                            return foundation_error(
+                                "mappings_load_failed",
+                                "Saved mappings could not be locked for a safe rescan.",
+                                true,
+                            );
+                        };
+                        match database.load_platform_mappings(&origin) {
+                            Ok(accepted) if !accepted.is_empty() => accepted,
+                            Ok(_) => match database.load_mapping_drafts(&origin) {
+                                Ok(drafts) => drafts,
+                                Err(error) => {
+                                    logging::error(
+                                        "mapping_drafts_load_failed",
+                                        &error.to_string(),
+                                    );
+                                    return foundation_error(
+                                        "mapping_drafts_load_failed",
+                                        "Saved mapping drafts are invalid. Restore them before rescanning.",
+                                        false,
+                                    );
+                                }
+                            },
+                            Err(error) => {
+                                logging::error("mappings_load_failed", &error.to_string());
+                                return foundation_error(
+                                    "mappings_load_failed",
+                                    "Accepted mappings are invalid. Restore them before rescanning.",
+                                    false,
+                                );
+                            }
+                        }
+                    } else {
+                        Vec::new()
+                    };
                     AgentResponse::MappingDetection {
-                        result: detect_platform_mappings(&platforms),
+                        result: merge_mapping_detection(
+                            detect_platform_mappings(&platforms),
+                            &existing,
+                        ),
                     }
                 }
                 Err(error) => connection_error(&state, error).await,
@@ -841,17 +952,101 @@ async fn dispatch(request: AgentRequest, state: Arc<AgentState>) -> AgentRespons
             }
             AgentResponse::MappingDrafts { drafts }
         }
+        AgentRequest::BrowseDirectories { path } => {
+            match tokio::task::spawn_blocking(move || browse_mapping_directories(path.as_deref()))
+                .await
+            {
+                Ok(Ok(listing)) => AgentResponse::DirectoryListing { listing },
+                Ok(Err(error)) => AgentResponse::Error { error },
+                Err(error) => foundation_error(
+                    "directory_browse_failed",
+                    &format!("The directory browser stopped unexpectedly: {error}"),
+                    true,
+                ),
+            }
+        }
+        AgentRequest::CreateDirectory {
+            parent_path,
+            name,
+            confirmed,
+        } => match tokio::task::spawn_blocking(move || {
+            create_mapping_directory(&parent_path, &name, confirmed)
+        })
+        .await
+        {
+            Ok(Ok(result)) => AgentResponse::DirectoryCreated { result },
+            Ok(Err(error)) => AgentResponse::Error { error },
+            Err(error) => foundation_error(
+                "directory_create_failed",
+                &format!("Directory creation stopped unexpectedly: {error}"),
+                true,
+            ),
+        },
         AgentRequest::ValidateMappings {
             drafts,
             no_platforms,
-        } => AgentResponse::MappingValidation {
-            result: validate_mapping_drafts(&drafts, no_platforms),
-        },
+        } => {
+            let result = match tokio::task::spawn_blocking(move || {
+                validate_mapping_drafts(&drafts, no_platforms)
+            })
+            .await
+            {
+                Ok(result) => result,
+                Err(error) => {
+                    return foundation_error(
+                        "mapping_validation_failed",
+                        &format!("Folder safety validation stopped unexpectedly: {error}"),
+                        true,
+                    );
+                }
+            };
+            AgentResponse::MappingValidation { result }
+        }
+        AgentRequest::RecheckMappings {
+            drafts,
+            no_platforms,
+        } => {
+            let checked_drafts = drafts.clone();
+            let result = match tokio::task::spawn_blocking(move || {
+                recheck_mapping_drafts(&checked_drafts, no_platforms)
+            })
+            .await
+            {
+                Ok(result) => result,
+                Err(error) => {
+                    return foundation_error(
+                        "mapping_recheck_failed",
+                        &format!("Folder safety recheck stopped unexpectedly: {error}"),
+                        true,
+                    );
+                }
+            };
+            if let Some(origin) = state.session.read().await.server_origin()
+                && let Ok(database) = state.database.lock()
+            {
+                let _ = database.update_mapping_validation_statuses(&origin, &result);
+            }
+            AgentResponse::MappingValidation { result }
+        }
         AgentRequest::SaveMappings {
             drafts,
             no_platforms,
         } => {
-            let validation = validate_mapping_drafts(&drafts, no_platforms);
+            let drafts_to_validate = drafts.clone();
+            let validation = match tokio::task::spawn_blocking(move || {
+                validate_mapping_drafts(&drafts_to_validate, no_platforms)
+            })
+            .await
+            {
+                Ok(result) => result,
+                Err(error) => {
+                    return foundation_error(
+                        "mapping_validation_failed",
+                        &format!("Folder safety validation stopped unexpectedly: {error}"),
+                        true,
+                    );
+                }
+            };
             if !validation.valid {
                 return AgentResponse::MappingValidation { result: validation };
             }
@@ -1011,7 +1206,10 @@ async fn dispatch(request: AgentRequest, state: Arc<AgentState>) -> AgentRespons
                 session.list_roms(limit, offset).await
             };
             match result {
-                Ok(page) => {
+                Ok(mut page) => {
+                    if let Ok(database) = state.database.lock() {
+                        let _ = database.apply_cached_favorite_states(&origin, &mut page);
+                    }
                     if state
                         .database
                         .lock()
@@ -1082,7 +1280,10 @@ async fn dispatch(request: AgentRequest, state: Arc<AgentState>) -> AgentRespons
                 session.list_library(&query, limit, offset).await
             };
             match result {
-                Ok(page) => {
+                Ok(mut page) => {
+                    if let Ok(database) = state.database.lock() {
+                        let _ = database.apply_cached_favorite_states(&origin, &mut page);
+                    }
                     if state
                         .database
                         .lock()
@@ -1141,7 +1342,13 @@ async fn dispatch(request: AgentRequest, state: Arc<AgentState>) -> AgentRespons
                 session.get_game_details(rom_id).await
             };
             match result {
-                Ok(details) => {
+                Ok(mut details) => {
+                    if let Some(cached) = state.database.lock().ok().and_then(|database| {
+                        database.load_library_rom(&origin, rom_id).ok().flatten()
+                    }) {
+                        details.rom.user.favorite = cached.user.favorite;
+                        details.rom.user.favorite_pending = cached.user.favorite_pending;
+                    }
                     if state
                         .database
                         .lock()
@@ -1173,6 +1380,127 @@ async fn dispatch(request: AgentRequest, state: Arc<AgentState>) -> AgentRespons
                     } else {
                         connection_error(&state, error).await
                     }
+                }
+                Err(error) => connection_error(&state, error).await,
+            }
+        }
+        AgentRequest::SetFavorite { rom_id, desired } => {
+            let _library_guard = state.library_request.lock().await;
+            if rom_id < 1 {
+                return foundation_error("invalid_rom_id", "ROM id must be positive.", false);
+            }
+            let Some(origin) = state.session.read().await.server_origin() else {
+                return foundation_error(
+                    "server_not_configured",
+                    "Connect to RomM before changing favorites.",
+                    false,
+                );
+            };
+            if *state.connection.read().await == ConnectionState::Offline {
+                return queue_favorite_for_later(&state, &origin, rom_id, desired).await;
+            }
+            let result = {
+                let session = state.session.read().await;
+                session.set_favorite(rom_id, desired).await
+            };
+            match result {
+                Ok(authoritative) => {
+                    if state
+                        .database
+                        .lock()
+                        .ok()
+                        .and_then(|database| {
+                            database
+                                .save_authoritative_favorite(
+                                    &origin,
+                                    &authoritative.result,
+                                    &authoritative.favorite_rom_ids,
+                                )
+                                .ok()
+                        })
+                        .is_none()
+                    {
+                        return foundation_error(
+                            "favorite_cache_save_failed",
+                            "RomM updated the favorite, but its authoritative state could not be cached.",
+                            true,
+                        );
+                    }
+                    state.session.write().await.mark_contact();
+                    *state.connection.write().await = ConnectionState::Connected;
+                    AgentResponse::FavoriteUpdated {
+                        result: authoritative.result,
+                    }
+                }
+                Err(error) if error.code == "favorite_rom_not_found" => {
+                    if let Ok(database) = state.database.lock() {
+                        let _ = database.mark_library_rom_unavailable(&origin, rom_id);
+                    }
+                    AgentResponse::Error { error }
+                }
+                Err(error) if error.retryable => {
+                    queue_favorite_for_later(&state, &origin, rom_id, desired).await
+                }
+                Err(error) => connection_error(&state, error).await,
+            }
+        }
+        AgentRequest::GetArtwork {
+            rom_id,
+            preferred_kind,
+            refresh,
+        } => {
+            if rom_id < 1 {
+                return foundation_error("invalid_rom_id", "ROM id must be positive.", false);
+            }
+            let Ok(_permit) = state.artwork_requests.acquire().await else {
+                return foundation_error(
+                    "artwork_unavailable",
+                    "Artwork loading is unavailable while the agent is shutting down.",
+                    true,
+                );
+            };
+            let Some(origin) = state.session.read().await.server_origin() else {
+                return foundation_error(
+                    "server_not_configured",
+                    "Connect to RomM before loading artwork.",
+                    false,
+                );
+            };
+            let rom = state
+                .database
+                .lock()
+                .ok()
+                .and_then(|database| database.load_library_rom(&origin, rom_id).ok().flatten());
+            let Some(rom) = rom else {
+                return AgentResponse::Artwork { artwork: None };
+            };
+            let Some(reference) = preferred_artwork(&rom.artwork, preferred_kind) else {
+                return AgentResponse::Artwork { artwork: None };
+            };
+            match load_artwork(&state, &origin, rom_id, reference, refresh).await {
+                Ok(artwork) => AgentResponse::Artwork {
+                    artwork: Some(Box::new(artwork)),
+                },
+                Err(error)
+                    if matches!(
+                        error.code.as_str(),
+                        "not_found"
+                            | "artwork_unavailable"
+                            | "invalid_artwork"
+                            | "invalid_artwork_path"
+                            | "artwork_too_large"
+                    ) =>
+                {
+                    logging::error("artwork_rejected", &error.message);
+                    AgentResponse::Artwork { artwork: None }
+                }
+                Err(error)
+                    if matches!(
+                        error.code.as_str(),
+                        "artwork_cache_failed" | "artwork_cache_write_failed"
+                    ) =>
+                {
+                    AgentResponse::Error { error }
                 }
                 Err(error) => connection_error(&state, error).await,
             }
@@ -1227,6 +1555,7 @@ async fn dispatch(request: AgentRequest, state: Arc<AgentState>) -> AgentRespons
         }
         AgentRequest::Logout { remove_device } => {
             let _registration_guard = state.device_registration.lock().await;
+            let server_origin = state.session.read().await.server_origin();
             let device = state
                 .database
                 .lock()
@@ -1286,6 +1615,9 @@ async fn dispatch(request: AgentRequest, state: Arc<AgentState>) -> AgentRespons
                 let _ = state.credentials.delete(&locator);
             }
             if let Ok(database) = state.database.lock() {
+                if let Some(origin) = server_origin.as_deref() {
+                    let _ = database.clear_pending_favorite_mutations(origin);
+                }
                 let _ = database.clear_credential_locator();
             }
             state.session.write().await.logout();
@@ -1310,10 +1642,11 @@ async fn persist_authentication(
     auth: &ValidatedAuth,
     save_credential: bool,
 ) -> AgentResponse {
-    let (base_url, server_version, http_approved, ca_id, last_contact_at_ms) = {
+    let (base_url, origin, server_version, http_approved, ca_id, last_contact_at_ms) = {
         let session = state.session.read().await;
         (
             session.base_url().unwrap_or_default(),
+            session.server_origin().unwrap_or_default(),
             session.server_version(),
             session.http_approved(),
             session.ca_id(),
@@ -1341,6 +1674,8 @@ async fn persist_authentication(
                         &base_url,
                         auth,
                         false,
+                        ConnectionState::Connected,
+                        None,
                         Some(format!(
                             "Connected for this session, but the credential could not be saved securely: {error}"
                         )),
@@ -1414,13 +1749,22 @@ async fn persist_authentication(
     }
     *state.connection.write().await = ConnectionState::Connected;
 
+    let favorite_reconciliation = reconcile_pending_favorites(state, &origin).await;
+
     let onboarding_warning = reconcile_onboarding_progress(state)
         .await
         .err()
         .map(|error| error.message);
 
     AgentResponse::Authenticated {
-        result: auth_result(&base_url, auth, true, onboarding_warning),
+        result: auth_result(
+            &base_url,
+            auth,
+            true,
+            state.connection.read().await.clone(),
+            favorite_reconciliation,
+            onboarding_warning,
+        ),
     }
 }
 
@@ -1683,6 +2027,8 @@ fn auth_result(
     base_url: &str,
     auth: &ValidatedAuth,
     credential_persisted: bool,
+    connection_state: ConnectionState,
+    favorite_reconciliation: Option<FavoriteReconciliationResult>,
     warning: Option<String>,
 ) -> AuthResult {
     AuthResult {
@@ -1693,7 +2039,256 @@ fn auth_result(
         account_name: auth.account_name.clone(),
         granted_scopes: auth.granted_scopes.clone(),
         credential_persisted,
+        connection_state,
+        favorite_reconciliation,
         warning,
+    }
+}
+
+async fn reconcile_pending_favorites(
+    state: &AgentState,
+    origin: &str,
+) -> Option<FavoriteReconciliationResult> {
+    let _library_guard = state.library_request.lock().await;
+    let pending = match state
+        .database
+        .lock()
+        .ok()
+        .and_then(|database| database.load_pending_favorite_mutations(origin).ok())
+    {
+        Some(pending) if pending.is_empty() => return None,
+        Some(pending) => pending,
+        None => {
+            return Some(FavoriteReconciliationResult {
+                paused_by: Some(AppError::new(
+                    "favorite_queue_load_failed",
+                    "The saved favorite queue could not be loaded.",
+                    true,
+                )),
+                ..FavoriteReconciliationResult::default()
+            });
+        }
+    };
+    let mut summary = FavoriteReconciliationResult {
+        queued: pending.len() as u64,
+        ..FavoriteReconciliationResult::default()
+    };
+
+    for (index, mutation) in pending.iter().enumerate() {
+        summary.attempted += 1;
+        let result = {
+            let session = state.session.read().await;
+            session
+                .set_favorite(mutation.rom_id, mutation.desired)
+                .await
+        };
+        match result {
+            Ok(authoritative) => {
+                let saved = state.database.lock().ok().and_then(|database| {
+                    database
+                        .save_authoritative_favorite(
+                            origin,
+                            &authoritative.result,
+                            &authoritative.favorite_rom_ids,
+                        )
+                        .ok()
+                });
+                if saved.is_none() {
+                    let error = AppError::new(
+                        "favorite_cache_save_failed",
+                        "RomM applied a queued favorite, but its local state could not be saved. It remains queued for an idempotent retry.",
+                        true,
+                    );
+                    summary.outcomes.push(FavoriteReconciliationOutcome {
+                        rom_id: mutation.rom_id,
+                        desired: mutation.desired,
+                        favorite: mutation.desired,
+                        status: FavoriteReconciliationStatus::Pending,
+                        error: Some(error.clone()),
+                    });
+                    append_pending_reconciliation_outcomes(
+                        &mut summary,
+                        &pending[index + 1..],
+                        None,
+                    );
+                    summary.paused_by = Some(error);
+                    break;
+                }
+                state.session.write().await.mark_contact();
+                summary.applied += 1;
+                summary.outcomes.push(FavoriteReconciliationOutcome {
+                    rom_id: mutation.rom_id,
+                    desired: mutation.desired,
+                    favorite: authoritative.result.favorite,
+                    status: FavoriteReconciliationStatus::Applied,
+                    error: None,
+                });
+            }
+            Err(error)
+                if error.code == "unauthorized" || error.code == "authentication_required" =>
+            {
+                append_pending_reconciliation_outcomes(
+                    &mut summary,
+                    &pending[index..],
+                    Some(error.clone()),
+                );
+                summary.paused_by = Some(error);
+                *state.connection.write().await = ConnectionState::Unauthorized;
+                break;
+            }
+            Err(error)
+                if error.code == "favorite_permission_denied" || error.code == "forbidden" =>
+            {
+                if state
+                    .database
+                    .lock()
+                    .ok()
+                    .and_then(|database| database.clear_pending_favorite_mutations(origin).ok())
+                    .is_some()
+                {
+                    for item in &pending[index..] {
+                        summary.discarded += 1;
+                        summary.outcomes.push(FavoriteReconciliationOutcome {
+                            rom_id: item.rom_id,
+                            desired: item.desired,
+                            favorite: item.base_favorite,
+                            status: FavoriteReconciliationStatus::Discarded,
+                            error: Some(error.clone()),
+                        });
+                    }
+                } else {
+                    append_pending_reconciliation_outcomes(
+                        &mut summary,
+                        &pending[index..],
+                        Some(error.clone()),
+                    );
+                }
+                summary.paused_by = Some(error);
+                *state.connection.write().await = ConnectionState::ScopeError;
+                break;
+            }
+            Err(error) if error.code == "favorite_rom_not_found" => {
+                let discarded = state.database.lock().ok().and_then(|database| {
+                    database
+                        .discard_pending_favorite_mutation(origin, mutation.rom_id, true)
+                        .ok()
+                        .flatten()
+                });
+                if discarded.is_none() {
+                    append_pending_reconciliation_outcomes(
+                        &mut summary,
+                        &pending[index..],
+                        Some(error.clone()),
+                    );
+                    summary.paused_by = Some(AppError::new(
+                        "favorite_queue_save_failed",
+                        "A missing RomM game could not be removed from the local favorite queue.",
+                        true,
+                    ));
+                    break;
+                }
+                summary.discarded += 1;
+                summary.outcomes.push(FavoriteReconciliationOutcome {
+                    rom_id: mutation.rom_id,
+                    desired: mutation.desired,
+                    favorite: mutation.base_favorite,
+                    status: FavoriteReconciliationStatus::Discarded,
+                    error: Some(error),
+                });
+            }
+            Err(error) if error.retryable => {
+                append_pending_reconciliation_outcomes(
+                    &mut summary,
+                    &pending[index..],
+                    Some(error.clone()),
+                );
+                summary.paused_by = Some(error);
+                *state.connection.write().await = ConnectionState::Offline;
+                break;
+            }
+            Err(error) => {
+                let discarded = state.database.lock().ok().and_then(|database| {
+                    database
+                        .discard_pending_favorite_mutation(origin, mutation.rom_id, false)
+                        .ok()
+                        .flatten()
+                });
+                if discarded.is_none() {
+                    append_pending_reconciliation_outcomes(
+                        &mut summary,
+                        &pending[index..],
+                        Some(error.clone()),
+                    );
+                    summary.paused_by = Some(AppError::new(
+                        "favorite_queue_save_failed",
+                        "A rejected favorite could not be removed from the local queue.",
+                        true,
+                    ));
+                    break;
+                }
+                summary.discarded += 1;
+                summary.outcomes.push(FavoriteReconciliationOutcome {
+                    rom_id: mutation.rom_id,
+                    desired: mutation.desired,
+                    favorite: mutation.base_favorite,
+                    status: FavoriteReconciliationStatus::Discarded,
+                    error: Some(error),
+                });
+            }
+        }
+    }
+
+    summary.remaining = state
+        .database
+        .lock()
+        .ok()
+        .and_then(|database| database.pending_favorite_count(origin).ok())
+        .unwrap_or(
+            summary
+                .queued
+                .saturating_sub(summary.applied + summary.discarded),
+        );
+    Some(summary)
+}
+
+fn append_pending_reconciliation_outcomes(
+    summary: &mut FavoriteReconciliationResult,
+    pending: &[romm_ipc::PendingFavoriteMutation],
+    error: Option<AppError>,
+) {
+    summary.outcomes.extend(
+        pending
+            .iter()
+            .map(|mutation| FavoriteReconciliationOutcome {
+                rom_id: mutation.rom_id,
+                desired: mutation.desired,
+                favorite: mutation.desired,
+                status: FavoriteReconciliationStatus::Pending,
+                error: error.clone(),
+            }),
+    );
+}
+
+async fn queue_favorite_for_later(
+    state: &AgentState,
+    origin: &str,
+    rom_id: i64,
+    desired: bool,
+) -> AgentResponse {
+    let queued = state.database.lock().ok().and_then(|database| {
+        database
+            .queue_favorite_mutation(origin, rom_id, desired)
+            .ok()
+    });
+    if let Some(mutation) = queued {
+        *state.connection.write().await = ConnectionState::Offline;
+        AgentResponse::FavoriteQueued { mutation }
+    } else {
+        foundation_error(
+            "favorite_queue_save_failed",
+            "RomM is offline and the favorite change could not be saved locally.",
+            true,
+        )
     }
 }
 
@@ -1702,7 +2297,9 @@ async fn connection_error(state: &AgentState, error: AppError) -> AgentResponse 
         "unauthorized" | "authentication_required" | "invalid_saved_credential" => {
             ConnectionState::Unauthorized
         }
-        "forbidden" | "missing_required_scopes" => ConnectionState::ScopeError,
+        "forbidden" | "missing_required_scopes" | "favorite_permission_denied" => {
+            ConnectionState::ScopeError
+        }
         "tls_error"
         | "invalid_ca_certificate"
         | "ca_certificate_missing"
@@ -1722,6 +2319,211 @@ async fn connection_error(state: &AgentState, error: AppError) -> AgentResponse 
         update_onboarding_best_effort(state, invalidate_authenticated_onboarding).await;
     }
     AgentResponse::Error { error }
+}
+
+fn preferred_artwork(
+    artwork: &[ArtworkReference],
+    preferred_kind: ArtworkKind,
+) -> Option<&ArtworkReference> {
+    artwork
+        .iter()
+        .find(|reference| reference.kind == preferred_kind && reference.remote_path.is_some())
+        .or_else(|| {
+            [ArtworkKind::CoverSmall, ArtworkKind::CoverLarge]
+                .into_iter()
+                .find_map(|kind| {
+                    artwork
+                        .iter()
+                        .find(|reference| reference.kind == kind && reference.remote_path.is_some())
+                })
+        })
+}
+
+async fn load_artwork(
+    state: &AgentState,
+    origin: &str,
+    rom_id: i64,
+    reference: &ArtworkReference,
+    refresh: bool,
+) -> Result<ArtworkPayload, AppError> {
+    let cache_key = artwork_cache_key(origin, &reference.cache_key);
+    let artwork_dir = state.paths.artwork_cache_dir();
+    if refresh {
+        evict_artwork_cache_entry(state, &artwork_dir, &cache_key)?;
+    } else if let Some(payload) = load_cached_artwork(state, &artwork_dir, rom_id, &cache_key)? {
+        return Ok(payload);
+    }
+
+    let fetched = {
+        let session = state.session.read().await;
+        session.fetch_artwork(reference).await?
+    };
+    fs::create_dir_all(&artwork_dir).map_err(|error| {
+        AppError::new(
+            "artwork_cache_write_failed",
+            format!("Unable to prepare the artwork cache: {error}"),
+            true,
+        )
+    })?;
+    let extension = extension_for_mime(&fetched.mime_type);
+    let hash = cache_key
+        .strip_prefix("artwork:")
+        .unwrap_or(cache_key.as_str());
+    let final_path = artwork_dir.join(format!("{hash}.{extension}"));
+    let temporary_path = artwork_dir.join(format!("{hash}.{}.part", Uuid::new_v4()));
+    fs::write(&temporary_path, &fetched.bytes).map_err(|error| {
+        AppError::new(
+            "artwork_cache_write_failed",
+            format!("Unable to write the artwork cache: {error}"),
+            true,
+        )
+    })?;
+    if let Err(error) = fs::rename(&temporary_path, &final_path) {
+        let _ = fs::remove_file(&temporary_path);
+        if !final_path.is_file() {
+            return Err(AppError::new(
+                "artwork_cache_write_failed",
+                format!("Unable to finalize the artwork cache: {error}"),
+                true,
+            ));
+        }
+    }
+    let entry = CacheEntryRecord {
+        key: cache_key.clone(),
+        local_path: final_path.clone(),
+        size_bytes: fetched.bytes.len() as u64,
+        etag: fetched.etag,
+        last_accessed_at_ms: current_time_ms(),
+    };
+    let save_result = {
+        let database = state
+            .database
+            .lock()
+            .map_err(|_| artwork_storage_error("The artwork cache database is unavailable."))?;
+        database
+            .save_cache_entry(&entry, "artwork")
+            .map_err(|error| artwork_storage_error(&error.to_string()))
+    };
+    if let Err(error) = save_result {
+        safely_remove_artwork_file(&artwork_dir, &final_path);
+        return Err(error);
+    }
+    let removed = {
+        let database = state
+            .database
+            .lock()
+            .map_err(|_| artwork_storage_error("The artwork cache database is unavailable."))?;
+        database
+            .prune_cache_entries("artwork", DEFAULT_ARTWORK_CACHE_BUDGET_BYTES)
+            .map_err(|error| artwork_storage_error(&error.to_string()))?
+    };
+    for entry in removed {
+        safely_remove_artwork_file(&artwork_dir, &entry.local_path);
+    }
+    state.session.write().await.mark_contact();
+    *state.connection.write().await = ConnectionState::Connected;
+    Ok(ArtworkPayload {
+        rom_id,
+        cache_key,
+        mime_type: fetched.mime_type,
+        data_base64: BASE64.encode(fetched.bytes),
+        source: romm_ipc::LibrarySource::Live,
+    })
+}
+
+fn load_cached_artwork(
+    state: &AgentState,
+    artwork_dir: &Path,
+    rom_id: i64,
+    cache_key: &str,
+) -> Result<Option<ArtworkPayload>, AppError> {
+    let entry = state
+        .database
+        .lock()
+        .map_err(|_| artwork_storage_error("The artwork cache database is unavailable."))?
+        .load_cache_entry(cache_key)
+        .map_err(|error| artwork_storage_error(&error.to_string()))?;
+    let Some(entry) = entry else {
+        return Ok(None);
+    };
+    if entry.local_path.parent() != Some(artwork_dir) {
+        evict_artwork_cache_entry(state, artwork_dir, cache_key)?;
+        return Ok(None);
+    }
+    let bytes = fs::read(&entry.local_path).ok();
+    let mime_type = bytes.as_deref().and_then(image_mime_type);
+    if let (Some(bytes), Some(mime_type)) = (bytes, mime_type)
+        && bytes.len() as u64 <= MAX_ARTWORK_BYTES
+    {
+        let mime_type = mime_type.to_owned();
+        state
+            .database
+            .lock()
+            .map_err(|_| artwork_storage_error("The artwork cache database is unavailable."))?
+            .touch_cache_entry(cache_key)
+            .map_err(|error| artwork_storage_error(&error.to_string()))?;
+        return Ok(Some(ArtworkPayload {
+            rom_id,
+            cache_key: cache_key.to_owned(),
+            mime_type,
+            data_base64: BASE64.encode(bytes),
+            source: romm_ipc::LibrarySource::Cache,
+        }));
+    }
+    evict_artwork_cache_entry(state, artwork_dir, cache_key)?;
+    Ok(None)
+}
+
+fn evict_artwork_cache_entry(
+    state: &AgentState,
+    artwork_dir: &Path,
+    cache_key: &str,
+) -> Result<(), AppError> {
+    let entry = state
+        .database
+        .lock()
+        .map_err(|_| artwork_storage_error("The artwork cache database is unavailable."))?
+        .remove_cache_entry(cache_key)
+        .map_err(|error| artwork_storage_error(&error.to_string()))?;
+    if let Some(entry) = entry {
+        safely_remove_artwork_file(artwork_dir, &entry.local_path);
+    }
+    Ok(())
+}
+
+fn safely_remove_artwork_file(artwork_dir: &Path, path: &Path) {
+    if path.parent() == Some(artwork_dir) {
+        let _ = fs::remove_file(path);
+    }
+}
+
+fn artwork_cache_key(origin: &str, reference_key: &str) -> String {
+    let digest = Sha256::digest(format!("{origin}\0{reference_key}").as_bytes());
+    format!("artwork:{digest:x}")
+}
+
+fn extension_for_mime(mime_type: &str) -> &'static str {
+    match mime_type {
+        "image/png" => "png",
+        "image/jpeg" => "jpg",
+        "image/webp" => "webp",
+        "image/gif" => "gif",
+        "image/avif" => "avif",
+        _ => "image",
+    }
+}
+
+fn artwork_storage_error(message: &str) -> AppError {
+    AppError::new("artwork_cache_failed", message, true)
+}
+
+fn current_time_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(i64::MAX)
 }
 
 fn foundation_error(code: &str, message: &str, retryable: bool) -> AgentResponse {
@@ -1765,6 +2567,7 @@ mod tests {
                 paths,
                 device_registration: AsyncMutex::new(()),
                 library_request: AsyncMutex::new(()),
+                artwork_requests: Semaphore::new(4),
                 onboarding: AsyncMutex::new(OnboardingState::default()),
                 background_configurer,
             }),
@@ -1941,6 +2744,103 @@ mod tests {
             AgentResponse::Settings {
                 settings: Some(settings)
             }
+        );
+    }
+
+    #[tokio::test]
+    async fn directory_browsing_and_confirmed_creation_round_trip_through_the_agent() {
+        let (temporary, state) = test_state();
+        let parent = temporary.path().join("mapping-browser");
+        fs::create_dir(&parent).expect("browser parent should exist");
+
+        let response = dispatch(
+            AgentRequest::BrowseDirectories {
+                path: Some(parent.to_string_lossy().into_owned()),
+            },
+            Arc::clone(&state),
+        )
+        .await;
+        assert!(matches!(
+            response,
+            AgentResponse::DirectoryListing { listing }
+                if listing.current_path.as_deref() == Some(parent.to_string_lossy().as_ref())
+        ));
+
+        let response = dispatch(
+            AgentRequest::CreateDirectory {
+                parent_path: parent.to_string_lossy().into_owned(),
+                name: "gba".to_owned(),
+                confirmed: false,
+            },
+            Arc::clone(&state),
+        )
+        .await;
+        assert!(matches!(
+            response,
+            AgentResponse::Error { error }
+                if error.code == "directory_creation_confirmation_required"
+        ));
+        assert!(!parent.join("gba").exists());
+
+        let response = dispatch(
+            AgentRequest::CreateDirectory {
+                parent_path: parent.to_string_lossy().into_owned(),
+                name: "gba".to_owned(),
+                confirmed: true,
+            },
+            state,
+        )
+        .await;
+        assert!(matches!(
+            response,
+            AgentResponse::DirectoryCreated { result } if result.created
+        ));
+        assert!(parent.join("gba").is_dir());
+    }
+
+    #[tokio::test]
+    async fn mapping_recheck_returns_read_only_path_health() {
+        let (temporary, state) = test_state();
+        let root = temporary.path().join("mapping-health");
+        fs::create_dir(&root).expect("mapping root should exist");
+        let draft = PlatformMappingDraft {
+            id: "platform-1".to_owned(),
+            platform_id: 1,
+            platform_name: "GBA".to_owned(),
+            platform_slug: "gba".to_owned(),
+            enabled: true,
+            rom_root: root.to_string_lossy().into_owned(),
+            save_roots: Vec::new(),
+            state_roots: Vec::new(),
+            archive_policy: romm_ipc::ArchivePolicy::Keep,
+            filename_strategy: "romm_filename".to_owned(),
+            source: romm_ipc::MappingSource::Custom,
+            preset_id: None,
+            preset_version: None,
+            custom_fields: Default::default(),
+        };
+
+        let response = dispatch(
+            AgentRequest::RecheckMappings {
+                drafts: vec![draft],
+                no_platforms: false,
+            },
+            state,
+        )
+        .await;
+        assert!(matches!(
+            response,
+            AgentResponse::MappingValidation { result }
+                if result.valid
+                    && result.paths.len() == 1
+                    && result.paths[0].status == romm_ipc::MappingPathStatus::Ready
+        ));
+        assert_eq!(
+            fs::read_dir(root)
+                .expect("mapping root should remain readable")
+                .count(),
+            0,
+            "read-only remount checks must not create probe files"
         );
     }
 
@@ -2129,6 +3029,308 @@ mod tests {
             *state.connection.read().await,
             ConnectionState::Unauthorized
         );
+    }
+
+    #[tokio::test]
+    async fn favorite_dispatch_returns_and_persists_authoritative_server_state() {
+        let base_url = mock_response_sequence(vec![
+            (
+                200,
+                serde_json::json!([{
+                    "id": 3,
+                    "is_favorite": true,
+                    "user_id": 7,
+                    "rom_ids": []
+                }]),
+            ),
+            (
+                200,
+                serde_json::json!({
+                    "id": 3,
+                    "is_favorite": true,
+                    "user_id": 7,
+                    "rom_ids": [42]
+                }),
+            ),
+        ])
+        .await;
+        let (_temporary, state) = test_state();
+        authenticate_test_state(&state, &base_url).await;
+        let origin = state
+            .session
+            .read()
+            .await
+            .server_origin()
+            .expect("origin should exist");
+        state
+            .database
+            .lock()
+            .expect("database should lock")
+            .save_library_page(
+                &origin,
+                &romm_ipc::RomPage {
+                    items: vec![romm_ipc::RomSummary {
+                        id: 42,
+                        title: "Chrono Trigger".to_owned(),
+                        platform: "SNES".to_owned(),
+                        ..romm_ipc::RomSummary::default()
+                    }],
+                    offset: 0,
+                    limit: 48,
+                    total: Some(1),
+                    has_more: false,
+                    source: romm_ipc::LibrarySource::Live,
+                    refreshed_at_ms: current_time_ms(),
+                    stale: false,
+                },
+            )
+            .expect("cached ROM should save");
+
+        let response = dispatch(
+            AgentRequest::SetFavorite {
+                rom_id: 42,
+                desired: true,
+            },
+            Arc::clone(&state),
+        )
+        .await;
+        assert!(matches!(
+            response,
+            AgentResponse::FavoriteUpdated { result }
+                if result.rom_id == 42 && result.favorite && result.collection_id == Some(3)
+        ));
+        let cached = state
+            .database
+            .lock()
+            .expect("database should lock")
+            .load_library_rom(&origin, 42)
+            .expect("cached ROM should load")
+            .expect("cached ROM should exist");
+        assert!(cached.user.favorite);
+        assert_eq!(*state.connection.read().await, ConnectionState::Connected);
+    }
+
+    #[tokio::test]
+    async fn retryable_favorite_failures_coalesce_into_the_durable_queue() {
+        let base_url = mock_response_sequence(vec![
+            (500, serde_json::json!({ "detail": "offline" })),
+            (500, serde_json::json!({ "detail": "still offline" })),
+        ])
+        .await;
+        let (_temporary, state) = test_state();
+        authenticate_test_state(&state, &base_url).await;
+        let origin = state
+            .session
+            .read()
+            .await
+            .server_origin()
+            .expect("origin should exist");
+        state
+            .database
+            .lock()
+            .expect("database should lock")
+            .save_library_page(
+                &origin,
+                &romm_ipc::RomPage {
+                    items: vec![romm_ipc::RomSummary {
+                        id: 42,
+                        title: "Chrono Trigger".to_owned(),
+                        platform: "SNES".to_owned(),
+                        ..romm_ipc::RomSummary::default()
+                    }],
+                    offset: 0,
+                    limit: 48,
+                    total: Some(1),
+                    has_more: false,
+                    source: romm_ipc::LibrarySource::Live,
+                    refreshed_at_ms: current_time_ms(),
+                    stale: false,
+                },
+            )
+            .expect("cached ROM should save");
+
+        let first = dispatch(
+            AgentRequest::SetFavorite {
+                rom_id: 42,
+                desired: true,
+            },
+            Arc::clone(&state),
+        )
+        .await;
+        assert!(matches!(
+            first,
+            AgentResponse::FavoriteQueued { mutation }
+                if mutation.rom_id == 42 && mutation.desired
+        ));
+        let second = dispatch(
+            AgentRequest::SetFavorite {
+                rom_id: 42,
+                desired: false,
+            },
+            Arc::clone(&state),
+        )
+        .await;
+        assert!(matches!(
+            second,
+            AgentResponse::FavoriteQueued { mutation }
+                if mutation.rom_id == 42 && !mutation.desired
+        ));
+
+        {
+            let database = state.database.lock().expect("database should lock");
+            assert_eq!(database.pending_favorite_count(&origin).unwrap(), 1);
+            let pending = database
+                .load_pending_favorite_mutations(&origin)
+                .expect("pending favorite should load");
+            assert_eq!(pending.len(), 1);
+            assert!(!pending[0].desired);
+            let cached = database
+                .load_library_rom(&origin, 42)
+                .expect("cached ROM should load")
+                .expect("cached ROM should exist");
+            assert!(!cached.user.favorite);
+            assert!(cached.user.favorite_pending);
+        }
+        assert_eq!(*state.connection.read().await, ConnectionState::Offline);
+    }
+
+    async fn seed_queued_favorite(state: &AgentState, origin: &str, rom_id: i64) {
+        state
+            .database
+            .lock()
+            .expect("database should lock")
+            .save_library_page(
+                origin,
+                &romm_ipc::RomPage {
+                    items: vec![romm_ipc::RomSummary {
+                        id: rom_id,
+                        title: format!("ROM {rom_id}"),
+                        platform: "Test".to_owned(),
+                        ..romm_ipc::RomSummary::default()
+                    }],
+                    offset: 0,
+                    limit: 48,
+                    total: Some(1),
+                    has_more: false,
+                    source: romm_ipc::LibrarySource::Live,
+                    refreshed_at_ms: current_time_ms(),
+                    stale: false,
+                },
+            )
+            .expect("cached ROM should save");
+        state
+            .database
+            .lock()
+            .expect("database should lock")
+            .queue_favorite_mutation(origin, rom_id, true)
+            .expect("favorite should queue");
+    }
+
+    #[tokio::test]
+    async fn reconnect_reconciliation_applies_queued_favorites_and_clears_pending_state() {
+        let base_url = mock_response_sequence(vec![
+            (200, serde_json::json!([])),
+            (
+                201,
+                serde_json::json!({
+                    "id": 3, "is_favorite": true, "user_id": 7, "rom_ids": []
+                }),
+            ),
+            (
+                200,
+                serde_json::json!({
+                    "id": 3, "is_favorite": true, "user_id": 7, "rom_ids": [42]
+                }),
+            ),
+        ])
+        .await;
+        let (_temporary, state) = test_state();
+        authenticate_test_state(&state, &base_url).await;
+        let origin = state.session.read().await.server_origin().unwrap();
+        seed_queued_favorite(&state, &origin, 42).await;
+
+        let result = reconcile_pending_favorites(&state, &origin)
+            .await
+            .expect("a non-empty queue should produce a summary");
+
+        assert_eq!(result.queued, 1);
+        assert_eq!(result.attempted, 1);
+        assert_eq!(result.applied, 1);
+        assert_eq!(result.discarded, 0);
+        assert_eq!(result.remaining, 0);
+        assert_eq!(
+            result.outcomes[0].status,
+            FavoriteReconciliationStatus::Applied
+        );
+        let database = state.database.lock().expect("database should lock");
+        assert_eq!(database.pending_favorite_count(&origin).unwrap(), 0);
+        let cached = database.load_library_rom(&origin, 42).unwrap().unwrap();
+        assert!(cached.user.favorite);
+        assert!(!cached.user.favorite_pending);
+    }
+
+    #[tokio::test]
+    async fn reconnect_reconciliation_pauses_without_deleting_on_unauthorized_or_retryable_errors()
+    {
+        for (status, expected_state) in [
+            (401, ConnectionState::Unauthorized),
+            (500, ConnectionState::Offline),
+        ] {
+            let base_url = mock_response_sequence(vec![(status, serde_json::json!({}))]).await;
+            let (_temporary, state) = test_state();
+            authenticate_test_state(&state, &base_url).await;
+            let origin = state.session.read().await.server_origin().unwrap();
+            seed_queued_favorite(&state, &origin, 42).await;
+
+            let result = reconcile_pending_favorites(&state, &origin).await.unwrap();
+
+            assert_eq!(result.remaining, 1);
+            assert_eq!(
+                result.outcomes[0].status,
+                FavoriteReconciliationStatus::Pending
+            );
+            assert!(result.paused_by.is_some());
+            assert_eq!(*state.connection.read().await, expected_state);
+            assert_eq!(
+                state
+                    .database
+                    .lock()
+                    .unwrap()
+                    .pending_favorite_count(&origin)
+                    .unwrap(),
+                1
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn reconnect_reconciliation_discards_forbidden_and_missing_rom_changes() {
+        for (status, expected_state) in [
+            (403, ConnectionState::ScopeError),
+            (404, ConnectionState::Connected),
+        ] {
+            let base_url = mock_response_sequence(vec![(status, serde_json::json!({}))]).await;
+            let (_temporary, state) = test_state();
+            authenticate_test_state(&state, &base_url).await;
+            *state.connection.write().await = ConnectionState::Connected;
+            let origin = state.session.read().await.server_origin().unwrap();
+            seed_queued_favorite(&state, &origin, 42).await;
+
+            let result = reconcile_pending_favorites(&state, &origin).await.unwrap();
+
+            assert_eq!(result.discarded, 1);
+            assert_eq!(result.remaining, 0);
+            assert_eq!(
+                result.outcomes[0].status,
+                FavoriteReconciliationStatus::Discarded
+            );
+            assert_eq!(*state.connection.read().await, expected_state);
+            let database = state.database.lock().unwrap();
+            assert_eq!(database.pending_favorite_count(&origin).unwrap(), 0);
+            let cached = database.load_library_rom(&origin, 42).unwrap().unwrap();
+            assert!(!cached.user.favorite);
+            assert!(!cached.user.favorite_pending);
+        }
     }
 
     #[tokio::test]

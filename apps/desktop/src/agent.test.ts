@@ -26,6 +26,109 @@ describe("agent response handling", () => {
     expect(requireSuccessfulResponse(response)).toEqual(response);
   });
 
+  it("keeps favorite queue and reconciliation aligned with Rust IPC v21", () => {
+    const response: AgentResponse = {
+      type: "favoriteQueued",
+      mutation: {
+        romId: 42,
+        desired: true,
+        baseFavorite: false,
+        baseUpdatedAt: "2026-09-04T12:00:00Z",
+        queuedAtMs: 1_725_451_200_000,
+        updatedAtMs: 1_725_451_260_000,
+      },
+    };
+    expect(requireSuccessfulResponse(response)).toEqual(response);
+
+    const authenticated: AgentResponse = {
+      type: "authenticated",
+      result: {
+        serverUrl: "https://romm.example.test/",
+        tokenKind: "client_api_token",
+        tokenId: 4,
+        accountId: 7,
+        accountName: "justin",
+        grantedScopes: ["collections.read", "collections.write"],
+        credentialPersisted: true,
+        connectionState: "connected",
+        favoriteReconciliation: {
+          queued: 1,
+          attempted: 1,
+          applied: 1,
+          discarded: 0,
+          remaining: 0,
+          outcomes: [{
+            romId: 42,
+            desired: true,
+            favorite: true,
+            status: "applied",
+          }],
+        },
+      },
+    };
+    expect(requireSuccessfulResponse(authenticated)).toEqual(authenticated);
+  });
+
+  it("keeps mapping browsing and safety aligned with Rust IPC v24", () => {
+    const response: AgentResponse = {
+      type: "directoryListing",
+      listing: {
+        currentPath: "C:\\Emulation\\roms",
+        parentPath: "C:\\Emulation",
+        entries: [{
+          name: "gba",
+          path: "C:\\Emulation\\roms\\gba",
+          isSymlink: false,
+        }],
+        locations: false,
+        truncated: false,
+      },
+    };
+    expect(requireSuccessfulResponse(response)).toEqual(response);
+
+    const safety: AgentResponse = {
+      type: "mappingValidation",
+      result: {
+        valid: true,
+        issues: [],
+        paths: [{
+          draftId: "platform-7",
+          field: "romRoot",
+          path: "D:\\Emulation\\roms\\gba",
+          canonicalPath: "D:\\Emulation\\roms\\gba",
+          status: "ready",
+          readable: true,
+          writable: true,
+          availableBytes: 8_589_934_592,
+          removable: true,
+          mounted: true,
+          containsSymlink: false,
+        }],
+      },
+    };
+    expect(requireSuccessfulResponse(safety)).toEqual(safety);
+
+    const detection: AgentResponse = {
+      type: "mappingDetection",
+      result: {
+        platforms: [],
+        drafts: [],
+        evidence: [],
+        detectedCount: 0,
+        presetUpdates: [{
+          draftId: "platform-7",
+          platformId: 7,
+          presetId: "emudeck",
+          fromVersion: 1,
+          toVersion: 2,
+          updatedFields: ["saveRoots"],
+          preservedCustomFields: ["romRoot"],
+        }],
+      },
+    };
+    expect(requireSuccessfulResponse(detection)).toEqual(detection);
+  });
+
   it("keeps the initial-refresh completion contract aligned with Rust IPC", () => {
     const response: AgentResponse = {
       type: "initialRefresh",

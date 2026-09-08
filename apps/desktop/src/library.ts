@@ -116,6 +116,9 @@ export interface LibraryCatalogState {
   total: number | null;
   nextOffset: number;
   hasMore: boolean;
+  source?: RomPage["source"];
+  refreshedAtMs?: number;
+  stale?: boolean;
 }
 
 export interface LibraryScrollMetrics {
@@ -135,6 +138,64 @@ export function mergeRomPages(
   return [...merged.values()];
 }
 
+export function setRomFavorite(
+  rom: RomSummary,
+  favorite: boolean,
+  favoritePending?: boolean,
+): RomSummary {
+  if (
+    rom.user.favorite === favorite &&
+    (favoritePending === undefined || Boolean(rom.user.favoritePending) === favoritePending)
+  ) return rom;
+  return {
+    ...rom,
+    user: {
+      ...rom.user,
+      favorite,
+      ...(favoritePending === undefined ? {} : { favoritePending }),
+    },
+  };
+}
+
+export function setFavoriteInRoms(
+  roms: RomSummary[],
+  romId: number,
+  favorite: boolean,
+  favoritePending?: boolean,
+): RomSummary[] {
+  let changed = false;
+  const next = roms.map((rom) => {
+    if (rom.id !== romId) return rom;
+    const updated = setRomFavorite(rom, favorite, favoritePending);
+    changed ||= updated !== rom;
+    return updated;
+  });
+  return changed ? next : roms;
+}
+
+export function setFavoriteInHomeShelves<T extends Record<string, RomSummary[]>>(
+  shelves: T,
+  sourceRom: RomSummary,
+  favorite: boolean,
+  favoriteLimit = HOME_SHELF_SIZE,
+  favoritePending?: boolean,
+): T {
+  const updatedRom = setRomFavorite(sourceRom, favorite, favoritePending);
+  const next = Object.fromEntries(
+    Object.entries(shelves).map(([name, items]) => {
+      if (name === "favorites") {
+        const withoutRom = items.filter((rom) => rom.id !== sourceRom.id);
+        return [
+          name,
+          favorite ? [updatedRom, ...withoutRom].slice(0, favoriteLimit) : withoutRom,
+        ];
+      }
+      return [name, setFavoriteInRoms(items, sourceRom.id, favorite, favoritePending)];
+    }),
+  );
+  return next as T;
+}
+
 export function applyRomPage(
   current: LibraryCatalogState,
   page: RomPage,
@@ -150,6 +211,9 @@ export function applyRomPage(
     total,
     nextOffset: page.offset + page.items.length,
     hasMore: page.hasMore && madeCursorProgress,
+    source: page.source,
+    refreshedAtMs: page.refreshedAtMs,
+    stale: page.stale,
   };
 }
 
@@ -176,6 +240,26 @@ export interface LibraryRequestGate {
   tryStart(): boolean;
   finish(): void;
   isActive(): boolean;
+}
+
+export interface PerRomMutationQueue {
+  enqueue(romId: number, operation: () => Promise<void>): Promise<void>;
+}
+
+export function createPerRomMutationQueue(): PerRomMutationQueue {
+  const tails = new Map<number, Promise<void>>();
+  return {
+    enqueue(romId, operation) {
+      const prior = tails.get(romId) ?? Promise.resolve();
+      const task = prior.catch(() => undefined).then(operation);
+      tails.set(romId, task);
+      const clear = () => {
+        if (tails.get(romId) === task) tails.delete(romId);
+      };
+      void task.then(clear, clear);
+      return task;
+    },
+  };
 }
 
 export function createLibraryRequestGate(): LibraryRequestGate {

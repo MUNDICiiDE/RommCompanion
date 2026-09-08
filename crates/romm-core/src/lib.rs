@@ -12,12 +12,17 @@ use device::{
     DeviceCreateResponse, DeviceRegistrationResult, RemoteDevice, create_payload,
     registration_fingerprint, update_payload,
 };
-use reqwest::{Certificate, Client, StatusCode};
+use reqwest::{
+    Certificate, Client, Method, StatusCode,
+    header::{CONTENT_LENGTH, ETAG},
+    multipart::Form,
+};
 use romm_ipc::{
-    AppError, ArtworkKind, ArtworkReference, CollectionKind, DeviceIdentity, GameCollection,
-    GameDetails, GameFile, GameSibling, LibraryCollection, LibraryMetadata, LibraryPlatform,
-    LibraryQuery, LibrarySort, LibrarySource, LibraryViewKind, LocalGameStatus, PlatformSummary,
-    ProbeResult, REQUIRED_SCOPES, RomPage, RomSummary, UserRomState,
+    AppError, ArtworkKind, ArtworkReference, CollectionKind, DeviceIdentity,
+    FavoriteMutationResult, GameCollection, GameDetails, GameFile, GameSibling, LibraryCollection,
+    LibraryMetadata, LibraryPlatform, LibraryQuery, LibrarySort, LibrarySource, LibraryViewKind,
+    LocalGameStatus, PlatformSummary, ProbeResult, REQUIRED_SCOPES, RomPage, RomSummary,
+    UserRomState,
 };
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -32,6 +37,28 @@ pub struct ValidatedAuth {
     pub account_name: String,
     pub granted_scopes: Vec<String>,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FetchedArtwork {
+    pub mime_type: String,
+    pub bytes: Vec<u8>,
+    pub etag: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthoritativeFavorite {
+    pub result: FavoriteMutationResult,
+    pub favorite_rom_ids: Vec<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FavoriteCollection {
+    id: i64,
+    rom_ids: Vec<i64>,
+    updated_at: Option<String>,
+}
+
+pub const MAX_ARTWORK_BYTES: u64 = 8 * 1024 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct RommSession {
@@ -879,6 +906,235 @@ impl RommSession {
         parse_game_details(&payload)
     }
 
+    pub async fn set_favorite(
+        &self,
+        rom_id: i64,
+        desired: bool,
+    ) -> Result<AuthoritativeFavorite, AppError> {
+        if rom_id < 1 {
+            return Err(AppError::new(
+                "invalid_rom_id",
+                "ROM id must be positive.",
+                false,
+            ));
+        }
+        let token = self.token.as_deref().ok_or_else(|| {
+            AppError::new(
+                "authentication_required",
+                "Pair before changing favorites.",
+                false,
+            )
+        })?;
+        for scope in ["collections.read", "collections.write"] {
+            if !self.granted_scopes.iter().any(|granted| granted == scope) {
+                return Err(favorite_permission_error(scope));
+            }
+        }
+        let account_id = self.account_id.ok_or_else(|| {
+            AppError::new(
+                "authentication_required",
+                "The authenticated account must be verified before changing favorites.",
+                false,
+            )
+        })?;
+
+        let payload = self
+            .get_authenticated_json(
+                "api/collections",
+                token,
+                "Unable to load the RomM favorites collection",
+            )
+            .await
+            .map_err(classify_favorite_error)?;
+        let mut collection = parse_favorite_collection(&payload, account_id)?;
+        if collection.is_none() && desired {
+            let mut url = self.endpoint("api/collections")?;
+            url.query_pairs_mut()
+                .append_pair("is_favorite", "true")
+                .append_pair("is_public", "false");
+            let response = self
+                .client
+                .post(url)
+                .bearer_auth(token)
+                .multipart(Form::new().text("name", "Favorites"))
+                .send()
+                .await
+                .map_err(network_error)?;
+            let status = response.status();
+            if !status.is_success() {
+                return Err(classify_favorite_error(http_error(
+                    status,
+                    "Unable to create the RomM favorites collection",
+                )));
+            }
+            let payload: Value = response.json().await.map_err(|error| {
+                AppError::new(
+                    "invalid_favorite_response",
+                    format!("RomM returned unreadable favorite data: {error}"),
+                    false,
+                )
+            })?;
+            collection = Some(parse_collection_membership(&payload)?);
+        }
+
+        let Some(mut collection) = collection else {
+            return Ok(AuthoritativeFavorite {
+                result: FavoriteMutationResult {
+                    rom_id,
+                    requested: desired,
+                    favorite: false,
+                    collection_id: None,
+                    collection_updated_at: None,
+                },
+                favorite_rom_ids: Vec::new(),
+            });
+        };
+        let currently_favorite = collection.rom_ids.contains(&rom_id);
+        if currently_favorite != desired {
+            let method = if desired {
+                Method::POST
+            } else {
+                Method::DELETE
+            };
+            let response = self
+                .client
+                .request(
+                    method,
+                    self.endpoint(&format!("api/collections/{}/roms", collection.id))?,
+                )
+                .bearer_auth(token)
+                .json(&json!({ "rom_ids": [rom_id] }))
+                .send()
+                .await
+                .map_err(network_error)?;
+            let status = response.status();
+            if !status.is_success() {
+                return Err(classify_favorite_error(http_error(
+                    status,
+                    "Unable to update the RomM favorites collection",
+                )));
+            }
+            let payload: Value = response.json().await.map_err(|error| {
+                AppError::new(
+                    "invalid_favorite_response",
+                    format!("RomM returned unreadable favorite data: {error}"),
+                    false,
+                )
+            })?;
+            collection = parse_collection_membership(&payload)?;
+        }
+
+        let favorite = collection.rom_ids.contains(&rom_id);
+        if favorite != desired {
+            return Err(AppError::new(
+                "favorite_not_applied",
+                "RomM accepted the request but returned a different favorite state.",
+                false,
+            )
+            .details(json!({ "romId": rom_id, "requested": desired, "favorite": favorite })));
+        }
+        Ok(AuthoritativeFavorite {
+            result: FavoriteMutationResult {
+                rom_id,
+                requested: desired,
+                favorite,
+                collection_id: Some(collection.id),
+                collection_updated_at: collection.updated_at,
+            },
+            favorite_rom_ids: collection.rom_ids,
+        })
+    }
+
+    pub async fn fetch_artwork(
+        &self,
+        artwork: &ArtworkReference,
+    ) -> Result<FetchedArtwork, AppError> {
+        let token = self.token.as_deref().ok_or_else(|| {
+            AppError::new(
+                "authentication_required",
+                "Pair before loading artwork.",
+                false,
+            )
+        })?;
+        let remote_path = artwork.remote_path.as_deref().ok_or_else(|| {
+            AppError::new(
+                "artwork_unavailable",
+                "RomM has no locally hosted artwork for this game.",
+                false,
+            )
+        })?;
+        let remote_path = remote_path.trim_start_matches('/');
+        let normalized_path = remote_path.to_ascii_lowercase();
+        if remote_path.is_empty()
+            || remote_path.split('/').any(|part| part == "..")
+            || remote_path.contains('\\')
+            || remote_path.contains('\0')
+            || remote_path.contains('?')
+            || remote_path.contains('#')
+            || normalized_path.contains("%2e")
+        {
+            return Err(AppError::new(
+                "invalid_artwork_path",
+                "RomM returned an unsafe artwork path.",
+                false,
+            ));
+        }
+        let path = if remote_path.starts_with("assets/") {
+            remote_path.to_owned()
+        } else {
+            format!("assets/romm/resources/{remote_path}")
+        };
+        let response = self
+            .client
+            .get(self.endpoint(&path)?)
+            .bearer_auth(token)
+            .send()
+            .await
+            .map_err(network_error)?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(http_error(status, "Unable to load game artwork"));
+        }
+        if response
+            .headers()
+            .get(CONTENT_LENGTH)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<u64>().ok())
+            .is_some_and(|length| length > MAX_ARTWORK_BYTES)
+        {
+            return Err(AppError::new(
+                "artwork_too_large",
+                "RomM artwork exceeds the 8 MiB safety limit.",
+                false,
+            ));
+        }
+        let etag = response
+            .headers()
+            .get(ETAG)
+            .and_then(|value| value.to_str().ok())
+            .map(ToOwned::to_owned);
+        let bytes = response.bytes().await.map_err(network_error)?;
+        if bytes.len() as u64 > MAX_ARTWORK_BYTES {
+            return Err(AppError::new(
+                "artwork_too_large",
+                "RomM artwork exceeds the 8 MiB safety limit.",
+                false,
+            ));
+        }
+        let mime_type = image_mime_type(&bytes).ok_or_else(|| {
+            AppError::new(
+                "invalid_artwork",
+                "RomM returned artwork in an unsupported or corrupt image format.",
+                false,
+            )
+        })?;
+        Ok(FetchedArtwork {
+            mime_type: mime_type.to_owned(),
+            bytes: bytes.to_vec(),
+            etag,
+        })
+    }
+
     pub async fn list_platforms(&self) -> Result<Vec<PlatformSummary>, AppError> {
         let token = self.token.as_deref().ok_or_else(|| {
             AppError::new(
@@ -1505,6 +1761,11 @@ fn parse_game_details(payload: &Value) -> Result<GameDetails, AppError> {
 }
 
 fn parse_artwork(value: &Value, rom_id: i64) -> Vec<ArtworkReference> {
+    let revision = value
+        .get("updated_at")
+        .or_else(|| value.get("updatedAt"))
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
     [
         (
             ArtworkKind::CoverSmall,
@@ -1527,7 +1788,10 @@ fn parse_artwork(value: &Value, rom_id: i64) -> Vec<ArtworkReference> {
             .to_owned();
         Some(ArtworkReference {
             kind,
-            cache_key: format!("rom:{rom_id}:{}:{remote_path}", artwork_kind_key(kind)),
+            cache_key: format!(
+                "rom:{rom_id}:{}:{remote_path}:{revision}",
+                artwork_kind_key(kind)
+            ),
             remote_path: Some(remote_path),
             remote_url: None,
         })
@@ -1540,7 +1804,7 @@ fn parse_artwork(value: &Value, rom_id: i64) -> Vec<ArtworkReference> {
             .filter(|url| !url.is_empty())
             .map(|url| ArtworkReference {
                 kind: ArtworkKind::RemoteCover,
-                cache_key: format!("rom:{rom_id}:remote-cover:{url}"),
+                cache_key: format!("rom:{rom_id}:remote-cover:{url}:{revision}"),
                 remote_path: None,
                 remote_url: Some(url.to_owned()),
             }),
@@ -1553,6 +1817,25 @@ fn artwork_kind_key(kind: ArtworkKind) -> &'static str {
         ArtworkKind::CoverSmall => "cover-small",
         ArtworkKind::CoverLarge => "cover-large",
         ArtworkKind::RemoteCover => "remote-cover",
+    }
+}
+
+pub fn image_mime_type(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        Some("image/png")
+    } else if bytes.starts_with(b"\xff\xd8\xff") {
+        Some("image/jpeg")
+    } else if bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP" {
+        Some("image/webp")
+    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        Some("image/gif")
+    } else if bytes.len() >= 12
+        && &bytes[4..8] == b"ftyp"
+        && (&bytes[8..12] == b"avif" || &bytes[8..12] == b"avis")
+    {
+        Some("image/avif")
+    } else {
+        None
     }
 }
 
@@ -1570,6 +1853,7 @@ fn parse_user_rom_state(value: &Value, rom_id: i64) -> UserRomState {
             .or_else(|| user.get("favorite"))
             .and_then(Value::as_bool)
             .unwrap_or(false),
+        favorite_pending: false,
         backlogged: user
             .get("backlogged")
             .and_then(Value::as_bool)
@@ -1673,6 +1957,11 @@ fn parse_collections(
                 id,
                 name,
                 kind,
+                is_favorite: value
+                    .get("is_favorite")
+                    .or_else(|| value.get("isFavorite"))
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
                 rom_ids,
                 rom_count,
                 updated_at: value
@@ -1683,6 +1972,107 @@ fn parse_collections(
             })
         })
         .collect())
+}
+
+fn parse_favorite_collection(
+    payload: &Value,
+    account_id: i64,
+) -> Result<Option<FavoriteCollection>, AppError> {
+    let values = payload
+        .as_array()
+        .or_else(|| payload.get("items").and_then(Value::as_array))
+        .or_else(|| payload.get("collections").and_then(Value::as_array))
+        .ok_or_else(|| {
+            AppError::new(
+                "invalid_favorite_response",
+                "RomM did not return a collection list while resolving favorites.",
+                false,
+            )
+        })?;
+    let matches = values
+        .iter()
+        .filter(|value| {
+            value
+                .get("is_favorite")
+                .or_else(|| value.get("isFavorite"))
+                .and_then(Value::as_bool)
+                == Some(true)
+                && value
+                    .get("user_id")
+                    .or_else(|| value.get("userId"))
+                    .and_then(Value::as_i64)
+                    == Some(account_id)
+        })
+        .map(parse_collection_membership)
+        .collect::<Result<Vec<_>, _>>()?;
+    match matches.as_slice() {
+        [] => Ok(None),
+        [collection] => Ok(Some(collection.clone())),
+        _ => Err(AppError::new(
+            "ambiguous_favorite_collection",
+            "RomM returned more than one private favorites collection for this account.",
+            false,
+        )),
+    }
+}
+
+fn parse_collection_membership(payload: &Value) -> Result<FavoriteCollection, AppError> {
+    let id = payload.get("id").and_then(Value::as_i64).ok_or_else(|| {
+        AppError::new(
+            "invalid_favorite_response",
+            "RomM returned a favorites collection without an ID.",
+            false,
+        )
+    })?;
+    let rom_ids = payload
+        .get("rom_ids")
+        .or_else(|| payload.get("romIds"))
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            AppError::new(
+                "invalid_favorite_response",
+                "RomM returned a favorites collection without its ROM membership.",
+                false,
+            )
+        })?
+        .iter()
+        .filter_map(Value::as_i64)
+        .collect();
+    Ok(FavoriteCollection {
+        id,
+        rom_ids,
+        updated_at: payload
+            .get("updated_at")
+            .or_else(|| payload.get("updatedAt"))
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned),
+    })
+}
+
+fn favorite_permission_error(scope: &str) -> AppError {
+    AppError::new(
+        "favorite_permission_denied",
+        format!("Changing favorites requires the `{scope}` token permission."),
+        false,
+    )
+    .details(json!({ "missingScope": scope }))
+}
+
+fn classify_favorite_error(error: AppError) -> AppError {
+    match error.code.as_str() {
+        "forbidden" => favorite_permission_error("collections.write"),
+        "not_found" => AppError::new(
+            "favorite_rom_not_found",
+            "The game or favorites collection is no longer available on RomM.",
+            false,
+        ),
+        "http_error" => AppError::new(
+            "favorite_rejected",
+            "RomM rejected the favorite change.",
+            false,
+        ),
+        _ => error,
+    }
 }
 
 fn parse_platforms(payload: &Value) -> Result<Vec<PlatformSummary>, AppError> {
@@ -2187,10 +2577,58 @@ mod tests {
         assert!(rom.user.backlogged);
         assert_eq!(rom.user.rating, 9);
         assert_eq!(rom.artwork.len(), 2);
+        assert!(
+            rom.artwork[0].cache_key.contains("2026-08-31T12:00:00Z"),
+            "artwork cache keys must change when RomM updates the ROM"
+        );
         assert_eq!(rom.remote_filename.as_deref(), Some("Chrono Trigger.sfc"));
         assert_eq!(rom.remote_size_bytes, Some(4_194_304));
         assert_eq!(page.source, LibrarySource::Live);
         assert!(!page.stale);
+    }
+
+    #[test]
+    fn accepts_supported_image_signatures_and_rejects_active_content() {
+        assert_eq!(image_mime_type(b"\x89PNG\r\n\x1a\nrest"), Some("image/png"));
+        assert_eq!(image_mime_type(b"\xff\xd8\xffrest"), Some("image/jpeg"));
+        assert_eq!(
+            image_mime_type(b"RIFF\x00\x00\x00\x00WEBPrest"),
+            Some("image/webp")
+        );
+        assert_eq!(image_mime_type(b"GIF89arest"), Some("image/gif"));
+        assert_eq!(
+            image_mime_type(b"\x00\x00\x00\x18ftypavifrest"),
+            Some("image/avif")
+        );
+        assert_eq!(image_mime_type(b"<svg onload='alert(1)'></svg>"), None);
+        assert_eq!(image_mime_type(b"<html>not artwork</html>"), None);
+    }
+
+    #[tokio::test]
+    async fn rejects_unsafe_or_external_artwork_before_contacting_the_server() {
+        let session = authenticated_session("http://127.0.0.1:9");
+        for remote_path in ["../secret.png", "covers\\secret.png", ""] {
+            let error = session
+                .fetch_artwork(&ArtworkReference {
+                    kind: ArtworkKind::CoverSmall,
+                    remote_path: Some(remote_path.to_owned()),
+                    remote_url: None,
+                    cache_key: "unsafe".to_owned(),
+                })
+                .await
+                .expect_err("unsafe artwork paths must be rejected");
+            assert_eq!(error.code, "invalid_artwork_path");
+        }
+        let error = session
+            .fetch_artwork(&ArtworkReference {
+                kind: ArtworkKind::RemoteCover,
+                remote_path: None,
+                remote_url: Some("https://images.example.test/cover.png".to_owned()),
+                cache_key: "external".to_owned(),
+            })
+            .await
+            .expect_err("external URLs must not be fetched by the authenticated client");
+        assert_eq!(error.code, "artwork_unavailable");
     }
 
     #[tokio::test]
@@ -2225,6 +2663,163 @@ mod tests {
         assert_eq!(metadata.collections[0].kind, CollectionKind::Standard);
         assert_eq!(metadata.collections[1].kind, CollectionKind::Smart);
         assert_eq!(metadata.source, LibrarySource::Live);
+    }
+
+    #[tokio::test]
+    async fn adds_and_removes_favorites_through_the_private_favorites_collection() {
+        let add_server = mock_json_server(vec![
+            (
+                200,
+                json!([{
+                    "id": 3,
+                    "name": "Favorites",
+                    "is_favorite": true,
+                    "user_id": 7,
+                    "rom_ids": []
+                }])
+                .to_string(),
+            ),
+            (
+                200,
+                json!({
+                    "id": 3,
+                    "is_favorite": true,
+                    "user_id": 7,
+                    "rom_ids": [42],
+                    "updated_at": "2026-09-04T12:00:00Z"
+                })
+                .to_string(),
+            ),
+        ])
+        .await;
+        let added = authenticated_session(&add_server)
+            .set_favorite(42, true)
+            .await
+            .expect("favorite should be added");
+        assert!(added.result.favorite);
+        assert_eq!(added.result.collection_id, Some(3));
+        assert_eq!(added.favorite_rom_ids, vec![42]);
+
+        let remove_server = mock_json_server(vec![
+            (
+                200,
+                json!([{
+                    "id": 3,
+                    "name": "Favorites",
+                    "is_favorite": true,
+                    "user_id": 7,
+                    "rom_ids": [42]
+                }])
+                .to_string(),
+            ),
+            (
+                200,
+                json!({
+                    "id": 3,
+                    "is_favorite": true,
+                    "user_id": 7,
+                    "rom_ids": []
+                })
+                .to_string(),
+            ),
+        ])
+        .await;
+        let removed = authenticated_session(&remove_server)
+            .set_favorite(42, false)
+            .await
+            .expect("favorite should be removed");
+        assert!(!removed.result.favorite);
+        assert!(removed.favorite_rom_ids.is_empty());
+    }
+
+    #[tokio::test]
+    async fn creates_favorites_only_when_the_first_addition_needs_it() {
+        let create_server = mock_json_server(vec![
+            (200, "[]".to_owned()),
+            (
+                200,
+                json!({
+                    "id": 3,
+                    "is_favorite": true,
+                    "user_id": 7,
+                    "rom_ids": []
+                })
+                .to_string(),
+            ),
+            (
+                200,
+                json!({
+                    "id": 3,
+                    "is_favorite": true,
+                    "user_id": 7,
+                    "rom_ids": [42]
+                })
+                .to_string(),
+            ),
+        ])
+        .await;
+        let created = authenticated_session(&create_server)
+            .set_favorite(42, true)
+            .await
+            .expect("first favorite should create the collection");
+        assert!(created.result.favorite);
+        assert_eq!(created.result.collection_id, Some(3));
+
+        let no_op_server = mock_json_server(vec![(200, "[]".to_owned())]).await;
+        let removed = authenticated_session(&no_op_server)
+            .set_favorite(42, false)
+            .await
+            .expect("removing without a favorites collection should be a no-op");
+        assert!(!removed.result.favorite);
+        assert_eq!(removed.result.collection_id, None);
+    }
+
+    #[tokio::test]
+    async fn favorite_failures_identify_permissions_and_missing_roms() {
+        let forbidden = mock_json_server(vec![(403, "{}".to_owned())]).await;
+        let error = authenticated_session(&forbidden)
+            .set_favorite(42, true)
+            .await
+            .expect_err("403 should fail");
+        assert_eq!(error.code, "favorite_permission_denied");
+        assert_eq!(
+            error.details.as_deref(),
+            Some(&json!({ "missingScope": "collections.write" }))
+        );
+
+        let missing = mock_json_server(vec![
+            (
+                200,
+                json!([{
+                    "id": 3,
+                    "is_favorite": true,
+                    "user_id": 7,
+                    "rom_ids": []
+                }])
+                .to_string(),
+            ),
+            (404, "{}".to_owned()),
+        ])
+        .await;
+        let error = authenticated_session(&missing)
+            .set_favorite(42, true)
+            .await
+            .expect_err("404 should fail");
+        assert_eq!(error.code, "favorite_rom_not_found");
+        assert!(!error.retryable);
+    }
+
+    #[test]
+    fn resolves_only_the_authenticated_accounts_favorites_collection() {
+        let payload = json!([
+            { "id": 1, "is_favorite": true, "user_id": 99, "rom_ids": [5] },
+            { "id": 3, "is_favorite": true, "user_id": 7, "rom_ids": [42] }
+        ]);
+        let collection = parse_favorite_collection(&payload, 7)
+            .expect("collection response should parse")
+            .expect("own favorites collection should exist");
+        assert_eq!(collection.id, 3);
+        assert_eq!(collection.rom_ids, vec![42]);
     }
 
     #[test]

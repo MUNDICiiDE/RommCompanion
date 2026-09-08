@@ -16,7 +16,10 @@ export type AgentRequest =
   | { type: "detectMappings" }
   | { type: "getMappingDrafts" }
   | { type: "saveMappingDrafts"; drafts: PlatformMappingDraft[] }
+  | { type: "browseDirectories"; path?: string }
+  | { type: "createDirectory"; parentPath: string; name: string; confirmed: boolean }
   | { type: "validateMappings"; drafts: PlatformMappingDraft[]; noPlatforms: boolean }
+  | { type: "recheckMappings"; drafts: PlatformMappingDraft[]; noPlatforms: boolean }
   | { type: "saveMappings"; drafts: PlatformMappingDraft[]; noPlatforms: boolean }
   | {
       type: "configureOnboardingPreferences";
@@ -27,6 +30,8 @@ export type AgentRequest =
   | { type: "listRoms"; limit: number; offset: number }
   | { type: "listLibrary"; query: LibraryQuery; limit: number; offset: number }
   | { type: "getGameDetails"; romId: number }
+  | { type: "setFavorite"; romId: number; desired: boolean }
+  | { type: "getArtwork"; romId: number; preferredKind: ArtworkKind; refresh: boolean }
   | { type: "getLibraryMetadata" }
   | { type: "logout"; removeDevice: boolean }
   | { type: "shutdown" };
@@ -66,6 +71,7 @@ export interface AgentStatus {
   caId?: string;
   httpApproved: boolean;
   device: DeviceIdentity | null;
+  pendingFavoriteCount: number;
 }
 
 export type OnboardingStep =
@@ -157,9 +163,30 @@ export interface MappingValidationIssue {
   message: string;
 }
 
+export type MappingPathStatus =
+  | "ready"
+  | "temporarily_unavailable"
+  | "permission_denied"
+  | "unsafe";
+
+export interface MappingPathValidation {
+  draftId: string;
+  field: string;
+  path: string;
+  canonicalPath?: string;
+  status: MappingPathStatus;
+  readable: boolean;
+  writable: boolean;
+  availableBytes?: number;
+  removable: boolean;
+  mounted: boolean;
+  containsSymlink: boolean;
+}
+
 export interface MappingValidationResult {
   valid: boolean;
   issues: MappingValidationIssue[];
+  paths: MappingPathValidation[];
 }
 
 export interface MappingDetectionResult {
@@ -167,6 +194,36 @@ export interface MappingDetectionResult {
   drafts: PlatformMappingDraft[];
   evidence: DetectionEvidence[];
   detectedCount: number;
+  presetUpdates: MappingPresetUpdate[];
+}
+
+export interface MappingPresetUpdate {
+  draftId: string;
+  platformId: number;
+  presetId: string;
+  fromVersion: number | null;
+  toVersion: number;
+  updatedFields: string[];
+  preservedCustomFields: string[];
+}
+
+export interface DirectoryEntry {
+  name: string;
+  path: string;
+  isSymlink: boolean;
+}
+
+export interface DirectoryListing {
+  currentPath?: string;
+  parentPath?: string;
+  entries: DirectoryEntry[];
+  locations: boolean;
+  truncated: boolean;
+}
+
+export interface DirectoryCreationResult {
+  path: string;
+  created: boolean;
 }
 
 export interface ProbeResult {
@@ -226,7 +283,11 @@ export interface RomSummary {
 }
 
 export type ArtworkKind = "cover_small" | "cover_large" | "remote_cover";
-export type LocalGameStatus = "remote_only" | "downloaded" | "missing_local";
+export type LocalGameStatus =
+  | "remote_only"
+  | "downloaded"
+  | "missing_local"
+  | "unavailable_on_server";
 export type LibrarySource = "live" | "cache";
 export type LibraryViewKind =
   | "all"
@@ -258,9 +319,18 @@ export interface ArtworkReference {
   cacheKey: string;
 }
 
+export interface ArtworkPayload {
+  romId: number;
+  cacheKey: string;
+  mimeType: string;
+  dataBase64: string;
+  source: LibrarySource;
+}
+
 export interface UserRomState {
   romId: number;
   favorite: boolean;
+  favoritePending?: boolean;
   backlogged: boolean;
   hidden: boolean;
   rating: number;
@@ -269,6 +339,56 @@ export interface UserRomState {
   status?: string;
   lastPlayed?: string;
   updatedAt?: string;
+}
+
+export interface FavoriteMutationResult {
+  romId: number;
+  requested: boolean;
+  favorite: boolean;
+  collectionId?: number;
+  collectionUpdatedAt?: string;
+}
+
+export interface PendingFavoriteMutation {
+  romId: number;
+  desired: boolean;
+  baseFavorite: boolean;
+  baseUpdatedAt?: string;
+  queuedAtMs: number;
+  updatedAtMs: number;
+}
+
+export type FavoriteReconciliationStatus = "applied" | "discarded" | "pending";
+
+export interface FavoriteReconciliationOutcome {
+  romId: number;
+  desired: boolean;
+  favorite: boolean;
+  status: FavoriteReconciliationStatus;
+  error?: AppError;
+}
+
+export interface FavoriteReconciliationResult {
+  queued: number;
+  attempted: number;
+  applied: number;
+  discarded: number;
+  remaining: number;
+  outcomes: FavoriteReconciliationOutcome[];
+  pausedBy?: AppError;
+}
+
+export interface AuthResult {
+  serverUrl: string;
+  tokenKind: string;
+  tokenId: number;
+  accountId: number;
+  accountName: string;
+  grantedScopes: string[];
+  credentialPersisted: boolean;
+  connectionState: AgentStatus["connection"];
+  favoriteReconciliation?: FavoriteReconciliationResult;
+  warning?: string;
 }
 
 export interface LibraryPlatform {
@@ -282,6 +402,7 @@ export interface LibraryCollection {
   id: number;
   name: string;
   kind: "standard" | "smart";
+  isFavorite: boolean;
   romIds: number[];
   romCount?: number;
   updatedAt?: string;
@@ -362,19 +483,7 @@ export type AgentResponse =
       type: "caImported";
       result: { caId: string; fingerprint: string; serverOrigin: string };
     }
-  | {
-      type: "authenticated";
-      result: {
-        serverUrl: string;
-        tokenKind: string;
-        tokenId: number;
-        accountId: number;
-        accountName: string;
-        grantedScopes: string[];
-        credentialPersisted: boolean;
-        warning?: string;
-      };
-    }
+  | { type: "authenticated"; result: AuthResult }
   | { type: "deviceProposed"; device: DeviceIdentity }
   | { type: "deviceRegistered"; device: DeviceIdentity; newlyRegistered: boolean }
   | { type: "deviceUpdated"; device: DeviceIdentity }
@@ -385,6 +494,8 @@ export type AgentResponse =
     }
   | { type: "mappingDetection"; result: MappingDetectionResult }
   | { type: "mappingDrafts"; drafts: PlatformMappingDraft[] }
+  | { type: "directoryListing"; listing: DirectoryListing }
+  | { type: "directoryCreated"; result: DirectoryCreationResult }
   | { type: "mappingValidation"; result: MappingValidationResult }
   | {
       type: "mappingsSaved";
@@ -413,6 +524,9 @@ export type AgentResponse =
   | { type: "roms"; page: RomPage }
   | { type: "libraryPage"; query: LibraryQuery; page: RomPage }
   | { type: "gameDetails"; details: GameDetails }
+  | { type: "favoriteUpdated"; result: FavoriteMutationResult }
+  | { type: "favoriteQueued"; mutation: PendingFavoriteMutation }
+  | { type: "artwork"; artwork?: ArtworkPayload }
   | { type: "libraryMetadata"; metadata: LibraryMetadata }
   | {
       type: "loggedOut";

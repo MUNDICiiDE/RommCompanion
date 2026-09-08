@@ -19,7 +19,8 @@ base64 = "0.22"
 fs2 = "0.4"
 gilrs = "0.11"
 keyring = { version = "3.6.3", default-features = false }
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+libc = "0.2"
+reqwest = { version = "0.12", default-features = false, features = ["json", "multipart", "rustls-tls"] }
 romm-core = { path = "crates/romm-core" }
 romm-ipc = { path = "crates/romm-ipc" }
 rusqlite = { version = "0.37", features = ["bundled"] }
@@ -32,6 +33,7 @@ thiserror = "2"
 tokio = { version = "1", features = ["full"] }
 url = "2"
 uuid = { version = "1", features = ["v4"] }
+windows-sys = { version = "0.60", features = ["Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_Threading", "Win32_System_WindowsProgramming"] }
 x509-parser = "0.18"
 
 [workspace.dependencies.tempfile]

@@ -3,6 +3,7 @@ export const REQUIRED_SCOPES = [
   "roms.read",
   "platforms.read",
   "collections.read",
+  "collections.write",
   "roms.user.read",
   "roms.user.write",
   "assets.read",

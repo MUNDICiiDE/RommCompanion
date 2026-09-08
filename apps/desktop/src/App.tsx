@@ -12,6 +12,7 @@ import { AnimatePresence, motion, useReducedMotion } from "motion/react";
 import type { FormEvent, ReactNode, UIEvent } from "react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { requestAgent } from "./agent";
+import { RomArtwork } from "./Artwork";
 import {
   modalityForKeyboardEvent,
   nextTrappedFocusIndex,
@@ -49,6 +50,7 @@ import {
   applyRomPage,
   buildDiscoveryQuery,
   createLibraryRequestGate,
+  createPerRomMutationQueue,
   DEFAULT_LIBRARY_FILTERS,
   HOME_SHELF_SIZE,
   LIBRARY_PAGE_SIZE,
@@ -60,17 +62,25 @@ import {
   nextLibraryTab,
   nextLibrarySort,
   queryForLibraryTab,
+  setFavoriteInHomeShelves,
+  setFavoriteInRoms,
+  setRomFavorite,
   shouldAutoLoadLibrary,
   type LibraryCatalogState,
   type LibraryDiscoveryFilters,
   type LibraryTab,
 } from "./library";
 import {
+  addMappingPath,
   ARCHIVE_POLICY_LABELS,
-  cycleArchivePolicy,
   issueForDraft,
-  updateMappingDraft,
+  normalizeMappingPaths,
+  removeMappingPath,
+  updateMappingArchivePolicy,
+  updateMappingEnabled,
   updateMappingPath,
+  updateMappingPathAt,
+  type MappingPathField,
 } from "./mapping";
 import {
   getOnboardingState,
@@ -101,13 +111,17 @@ import {
 import type {
   AppError,
   AgentResponse,
+  AuthResult,
   ControllerAction,
   ControllerBindings,
   ControllerSettings,
   ControllerStatus,
   DeviceIdentity,
   DetectionEvidence,
+  DirectoryListing,
+  FavoriteReconciliationResult,
   MappingValidationIssue,
+  MappingPathValidation,
   LibraryMetadata,
   LibraryQuery,
   GameDetails,
@@ -126,6 +140,25 @@ import {
 const DIRECTION_ACTIONS = new Set(["up", "down", "left", "right"]);
 const PAIRING_CODE_PATTERN = /^[A-Z0-9]{4}-[A-Z0-9]{4}$/;
 const PAIRING_TTL_SECONDS = 5 * 60;
+const authenticationNotice = (result: AuthResult) => {
+  const messages = result.warning ? [result.warning] : [];
+  const reconciliation = result.favoriteReconciliation;
+  if (reconciliation) {
+    if (reconciliation.applied > 0) {
+      messages.push(`${reconciliation.applied} queued favorite ${reconciliation.applied === 1 ? "change was" : "changes were"} synced.`);
+    }
+    if (reconciliation.discarded > 0) {
+      messages.push(`${reconciliation.discarded} queued favorite ${reconciliation.discarded === 1 ? "change was" : "changes were"} discarded because RomM could not apply ${reconciliation.discarded === 1 ? "it" : "them"}.`);
+    }
+    if (reconciliation.pausedBy && reconciliation.remaining === 0) {
+      messages.push(reconciliation.pausedBy.message);
+    }
+    if (reconciliation.remaining > 0) {
+      messages.push(`${reconciliation.remaining} favorite ${reconciliation.remaining === 1 ? "change remains" : "changes remain"} queued. ${reconciliation.pausedBy?.message ?? "Reconnect to try again."}`);
+    }
+  }
+  return messages.length > 0 ? messages.join(" ") : null;
+};
 const formatBytes = (bytes?: number) => {
   if (!bytes) return "Unknown size";
   const units = ["B", "KB", "MB", "GB", "TB"];
@@ -477,15 +510,39 @@ interface KeyboardSession {
   commit: (value: string) => void;
 }
 
+interface LibraryProvenance {
+  source: "live" | "cache" | "local";
+  stale: boolean;
+  refreshedAtMs: number;
+}
+
+interface FavoriteMutationFailure {
+  rom: RomSummary;
+  desired: boolean;
+  error: AppError;
+}
+
+interface DirectoryBrowserTarget {
+  draftId: string;
+  platformName: string;
+  field: MappingPathField;
+  index: number;
+  returnFocusKey: string;
+}
+
 function RomCard({
   rom,
   index,
   onOpen,
+  onToggleFavorite,
+  favoritePending,
   focusKey: providedFocusKey,
 }: {
   rom: RomSummary;
   index: number;
   onOpen: (rom: RomSummary) => void;
+  onToggleFavorite: (rom: RomSummary) => void;
+  favoritePending: boolean;
   focusKey?: string;
 }) {
   const reduceMotion = useReducedMotion();
@@ -493,27 +550,49 @@ function RomCard({
   useRegisteredFocusNode(focusKey, true);
   const { ref, focused } = useFocusable({ focusKey });
   return (
-    <motion.button
-      ref={ref}
-      type="button"
-      aria-label={`Open ${rom.title} for ${rom.platform}`}
-      data-rom-id={rom.id}
-      className={`rom-card ${focused ? "is-focused" : ""}`}
+    <motion.div
+      className="rom-card-shell"
       initial={reduceMotion ? false : { opacity: 0, y: 12 }}
       animate={{ opacity: 1, y: 0 }}
       transition={{ delay: reduceMotion ? 0 : Math.min(index * 0.025, 0.3) }}
-      onClick={() => onOpen(rom)}
-      onFocus={() => syncSpatialFocus(focusKey)}
-      onPointerDown={() => syncSpatialFocus(focusKey)}
     >
-      <div className="cover-placeholder" aria-hidden="true">
-        <span>{rom.title.slice(0, 1).toUpperCase()}</span>
-      </div>
-      <div>
-        <p className="platform">{rom.platform}</p>
-        <h3>{rom.title}</h3>
-      </div>
-    </motion.button>
+      <button
+        ref={ref}
+        type="button"
+        aria-label={`Open ${rom.title} for ${rom.platform}`}
+        data-rom-id={rom.id}
+        className={`rom-card ${focused ? "is-focused" : ""}`}
+        onClick={() => onOpen(rom)}
+        onFocus={() => syncSpatialFocus(focusKey)}
+        onPointerDown={() => syncSpatialFocus(focusKey)}
+      >
+        <RomArtwork rom={rom} />
+        <div>
+          <p className="platform">
+            {rom.platform}{rom.localStatus === "unavailable_on_server" ? " · unavailable" : ""}
+          </p>
+          <h3>{rom.title}</h3>
+        </div>
+      </button>
+      <button
+        type="button"
+        className={`rom-favorite-action ${rom.user.favorite ? "is-favorite" : ""} ${rom.user.favoritePending ? "is-queued" : ""}`}
+        aria-label={`${rom.user.favorite ? "Remove" : "Add"} ${rom.title} ${rom.user.favorite ? "from" : "to"} favorites${rom.user.favoritePending ? "; current change is queued" : ""}`}
+        aria-pressed={rom.user.favorite}
+        aria-busy={favoritePending}
+        data-rom-id={rom.id}
+        title={rom.user.favoritePending
+          ? "Favorite change queued to sync"
+          : rom.user.favorite ? "Remove from favorites" : "Add to favorites"}
+        onClick={() => onToggleFavorite(rom)}
+      >
+        <span aria-hidden="true">{rom.user.favorite ? "★" : "☆"}</span>
+        {favoritePending && <span className="favorite-saving-dot" aria-hidden="true" />}
+        {!favoritePending && rom.user.favoritePending && (
+          <span className="favorite-queued-badge" aria-hidden="true">Q</span>
+        )}
+      </button>
+    </motion.div>
   );
 }
 
@@ -551,6 +630,8 @@ export default function App() {
   const [message, setMessage] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [librarySourceNotice, setLibrarySourceNotice] = useState<string | null>(null);
+  const [libraryProvenance, setLibraryProvenance] = useState<LibraryProvenance | null>(null);
+  const [libraryError, setLibraryError] = useState<AppError | null>(null);
   const [lastError, setLastError] = useState<AppError | null>(null);
   const [httpWarningOrigin, setHttpWarningOrigin] = useState<string | null>(null);
   const [caId, setCaId] = useState<string | undefined>();
@@ -572,6 +653,10 @@ export default function App() {
   const [gameDetails, setGameDetails] = useState<GameDetails | null>(null);
   const [gameDetailsLoading, setGameDetailsLoading] = useState(false);
   const [gameDetailsError, setGameDetailsError] = useState<string | null>(null);
+  const [favoritePendingIds, setFavoritePendingIds] = useState<ReadonlySet<number>>(
+    () => new Set(),
+  );
+  const [favoriteFailure, setFavoriteFailure] = useState<FavoriteMutationFailure | null>(null);
   const [keyboard, setKeyboard] = useState<KeyboardSession | null>(null);
   const [inputModality, setInputModality] = useState<InputModality>("navigation");
   const [closeBehavior, setCloseBehavior] = useState<CloseBehavior>("minimizeToTray");
@@ -591,9 +676,17 @@ export default function App() {
   const [mappingEvidence, setMappingEvidence] = useState<DetectionEvidence[]>([]);
   const [mappingScanned, setMappingScanned] = useState(false);
   const [mappingIssues, setMappingIssues] = useState<MappingValidationIssue[]>([]);
+  const [mappingPathChecks, setMappingPathChecks] = useState<MappingPathValidation[]>([]);
   const [mappingPlatformSearch, setMappingPlatformSearch] = useState("");
   const [showAllMappingPlatforms, setShowAllMappingPlatforms] = useState(false);
   const [noPlatformsArmed, setNoPlatformsArmed] = useState(false);
+  const [directoryBrowserTarget, setDirectoryBrowserTarget] = useState<DirectoryBrowserTarget | null>(null);
+  const [directoryListing, setDirectoryListing] = useState<DirectoryListing | null>(null);
+  const [directoryBrowserBusy, setDirectoryBrowserBusy] = useState(false);
+  const [directoryBrowserError, setDirectoryBrowserError] = useState<string | null>(null);
+  const [directoryBrowserNotice, setDirectoryBrowserNotice] = useState<string | null>(null);
+  const [directoryCreationOpen, setDirectoryCreationOpen] = useState(false);
+  const [directoryName, setDirectoryName] = useState("");
   const libraryRequestGate = useRef(createLibraryRequestGate());
   const activeLibraryQueryRef = useRef<LibraryQuery>({ kind: "all" });
   const baseLibraryQueryRef = useRef<LibraryQuery>({ kind: "all" });
@@ -618,6 +711,13 @@ export default function App() {
   const initialRefreshAttempted = useRef(false);
   const contextReturnFocusKey = useRef("LIBRARY-TAB-HOME");
   const gameDetailsRequestRef = useRef(0);
+  const favoriteMutationQueue = useRef(createPerRomMutationQueue());
+  const favoriteMutationRevisions = useRef(new Map<number, number>());
+  const favoriteValues = useRef(new Map<number, boolean>());
+  const favoriteAuthoritativeValues = useRef(new Map<number, boolean>());
+  const favoriteQueuedDesiredValues = useRef(new Map<number, boolean>());
+  const favoritePendingRomIds = useRef(new Set<number>());
+  const favoriteSessionGeneration = useRef(0);
 
   const closeKeyboard = useCallback((restoreFocusKey: string) => {
     setKeyboard(null);
@@ -668,6 +768,25 @@ export default function App() {
     [],
   );
 
+  const reconcileLoadedFavorite = useCallback((rom: RomSummary) => {
+    const pendingFavorite = favoriteValues.current.get(rom.id);
+    if (favoritePendingRomIds.current.has(rom.id) && pendingFavorite !== undefined) {
+      return setRomFavorite(
+        rom,
+        pendingFavorite,
+        favoriteQueuedDesiredValues.current.has(rom.id),
+      );
+    }
+    favoriteValues.current.set(rom.id, rom.user.favorite);
+    if (rom.user.favoritePending) {
+      favoriteQueuedDesiredValues.current.set(rom.id, rom.user.favorite);
+    } else {
+      favoriteQueuedDesiredValues.current.delete(rom.id);
+      favoriteAuthoritativeValues.current.set(rom.id, rom.user.favorite);
+    }
+    return rom;
+  }, []);
+
   const loadRoms = useCallback(async (
     reset = true,
     automatic = false,
@@ -693,8 +812,28 @@ export default function App() {
       const response = await run(reset ? "library" : "library-more", () =>
         requestAgent({ type: "listLibrary", query, limit: LIBRARY_PAGE_SIZE, offset }),
       );
+      if (response?.type === "error") {
+        setLibraryError(response.error);
+      } else if (response === null) {
+        setLibraryError({
+          code: "library_request_failed",
+          message: "The library request could not be completed.",
+          retryable: true,
+        });
+      }
       if (response?.type === "libraryPage" && libraryQueryKey(response.query) === queryKey) {
-        const { page } = response;
+        const page = {
+          ...response.page,
+          items: response.page.items.map(reconcileLoadedFavorite),
+        };
+        setLibraryError(null);
+        setLibraryProvenance({
+          source: query.kind === "downloaded" || query.kind === "active_downloads"
+            ? "local"
+            : page.source,
+          stale: page.stale,
+          refreshedAtMs: page.refreshedAtMs,
+        });
         const catalog = applyRomPage({
           items: previous,
           total: priorCatalog?.total ?? null,
@@ -742,7 +881,7 @@ export default function App() {
       libraryRequestGate.current.finish();
       if (reset) setLibraryInitialized(true);
     }
-  }, [run]);
+  }, [reconcileLoadedFavorite, run]);
 
   const startInitialRefresh = useCallback(async () => {
     setLibraryInitialized(false);
@@ -754,7 +893,10 @@ export default function App() {
       return;
     }
 
-    const { page } = response.result;
+    const page = {
+      ...response.result.page,
+      items: response.result.page.items.map(reconcileLoadedFavorite),
+    };
     const catalog = applyRomPage({
       items: [],
       total: null,
@@ -770,6 +912,12 @@ export default function App() {
     hasMoreRomsRef.current = catalog.hasMore;
     setHasMoreRoms(hasMoreRomsRef.current);
     setLibrarySourceNotice(null);
+    setLibraryProvenance({
+      source: page.source,
+      stale: page.stale,
+      refreshedAtMs: page.refreshedAtMs,
+    });
+    setLibraryError(null);
     setLibraryInitialized(true);
     setNotice(
       catalog.items.length === 0
@@ -781,7 +929,7 @@ export default function App() {
       updateAllLayouts();
       window.requestAnimationFrame(() => setFocus(catalog.items[0] ? `ROM-${catalog.items[0].id}` : "REFRESH"));
     });
-  }, [onboarding, run]);
+  }, [onboarding, reconcileLoadedFavorite, run]);
 
   const handleLibraryScroll = useCallback((event: UIEvent<HTMLElement>) => {
     const view = event.currentTarget;
@@ -802,6 +950,14 @@ export default function App() {
     hasMoreRomsRef.current = next.hasMore;
     setHasMoreRoms(next.hasMore);
     setLibraryInitialized(Boolean(catalog));
+    setLibraryError(null);
+    setLibraryProvenance(catalog?.refreshedAtMs ? {
+      source: query.kind === "downloaded" || query.kind === "active_downloads"
+        ? "local"
+        : catalog.source ?? "cache",
+      stale: catalog.stale ?? false,
+      refreshedAtMs: catalog.refreshedAtMs,
+    } : null);
   }, []);
 
   const loadLibraryHome = useCallback(async () => {
@@ -817,7 +973,9 @@ export default function App() {
       ]);
       const [metadataResponse, recentResponse, favoritesResponse, downloadedResponse, downloadsResponse] = responses;
       if (metadataResponse.type === "libraryMetadata") setLibraryMetadata(metadataResponse.metadata);
-      const pageItems = (response: AgentResponse) => response.type === "libraryPage" ? response.page.items : [];
+      const pageItems = (response: AgentResponse) => response.type === "libraryPage"
+        ? response.page.items.map(reconcileLoadedFavorite)
+        : [];
       setHomeShelves({
         recent: pageItems(recentResponse),
         favorites: pageItems(favoritesResponse),
@@ -825,20 +983,211 @@ export default function App() {
         downloads: pageItems(downloadsResponse),
       });
       const firstError = responses.find((response) => response.type === "error");
-      if (firstError?.type === "error") setMessage(firstError.error.message);
+      if (firstError?.type === "error") {
+        setMessage(firstError.error.message);
+        setLibraryError(firstError.error);
+      } else {
+        setLibraryError(null);
+      }
       const cached = responses.some((response) =>
         response.type === "libraryPage" && response.page.source === "cache" && !response.query.kind.includes("download"),
       ) || (metadataResponse.type === "libraryMetadata" && metadataResponse.metadata.source === "cache");
       setLibrarySourceNotice(cached
         ? "RomM is offline. Home shelves are using the most recently cached data."
         : null);
+      const remoteSnapshots = responses.flatMap((response) => {
+        if (response.type === "libraryPage" && response.query.kind !== "downloaded" && response.query.kind !== "active_downloads") {
+          return [response.page];
+        }
+        return [];
+      });
+      const refreshedAtMs = Math.max(
+        metadataResponse.type === "libraryMetadata" ? metadataResponse.metadata.refreshedAtMs : 0,
+        ...remoteSnapshots.map((page) => page.refreshedAtMs),
+      );
+      if (refreshedAtMs > 0) {
+        setLibraryProvenance({
+          source: cached ? "cache" : "live",
+          stale: (metadataResponse.type === "libraryMetadata" && metadataResponse.metadata.stale) ||
+            remoteSnapshots.some((page) => page.stale),
+          refreshedAtMs,
+        });
+      }
     } catch (error) {
-      setMessage(error instanceof Error ? error.message : String(error));
+      const message = error instanceof Error ? error.message : String(error);
+      setMessage(message);
+      setLibraryError({ code: "library_request_failed", message, retryable: true });
     } finally {
       setHomeInitialized(true);
       setBusy(null);
     }
+  }, [reconcileLoadedFavorite]);
+
+  const applyFavoriteEverywhere = useCallback((
+    sourceRom: RomSummary,
+    favorite: boolean,
+    favoriteQueued: boolean,
+  ) => {
+    const updatedRom = setRomFavorite(sourceRom, favorite, favoriteQueued);
+    favoriteValues.current.set(sourceRom.id, favorite);
+
+    for (const [queryKey, catalog] of libraryCatalogsRef.current) {
+      const items = setFavoriteInRoms(
+        catalog.items,
+        sourceRom.id,
+        favorite,
+        favoriteQueued,
+      );
+      if (items !== catalog.items) {
+        libraryCatalogsRef.current.set(queryKey, { ...catalog, items });
+      }
+    }
+
+    setRoms((current) => {
+      const next = setFavoriteInRoms(current, sourceRom.id, favorite, favoriteQueued);
+      romsRef.current = next;
+      return next;
+    });
+    setHomeShelves((current) =>
+      setFavoriteInHomeShelves(current, updatedRom, favorite, HOME_SHELF_SIZE, favoriteQueued),
+    );
+    setContextRom((current) =>
+      current?.id === sourceRom.id
+        ? setRomFavorite(current, favorite, favoriteQueued)
+        : current,
+    );
+    setGameDetails((current) =>
+      current?.rom.id === sourceRom.id
+        ? { ...current, rom: setRomFavorite(current.rom, favorite, favoriteQueued) }
+        : current,
+    );
   }, []);
+
+  const applyFavoriteReconciliation = useCallback((result?: FavoriteReconciliationResult) => {
+    if (!result) return;
+    const settledIds = new Set<number>();
+    for (const outcome of result.outcomes) {
+      favoriteMutationRevisions.current.set(
+        outcome.romId,
+        (favoriteMutationRevisions.current.get(outcome.romId) ?? 0) + 1,
+      );
+      favoritePendingRomIds.current.delete(outcome.romId);
+      settledIds.add(outcome.romId);
+      if (outcome.status === "pending") {
+        favoriteQueuedDesiredValues.current.set(outcome.romId, outcome.favorite);
+      } else {
+        favoriteQueuedDesiredValues.current.delete(outcome.romId);
+        favoriteAuthoritativeValues.current.set(outcome.romId, outcome.favorite);
+      }
+      const sourceRom = romsRef.current.find((rom) => rom.id === outcome.romId) ??
+        [...libraryCatalogsRef.current.values()]
+          .flatMap((catalog) => catalog.items)
+          .find((rom) => rom.id === outcome.romId) ??
+        (contextRom?.id === outcome.romId ? contextRom : undefined) ??
+        (gameDetails?.rom.id === outcome.romId ? gameDetails.rom : undefined);
+      if (sourceRom) {
+        applyFavoriteEverywhere(
+          sourceRom,
+          outcome.favorite,
+          outcome.status === "pending",
+        );
+      }
+    }
+    if (settledIds.size > 0) {
+      setFavoritePendingIds((current) => {
+        const next = new Set(current);
+        for (const romId of settledIds) next.delete(romId);
+        return next;
+      });
+    }
+  }, [applyFavoriteEverywhere, contextRom, gameDetails]);
+
+  const setFavoriteOptimistically = useCallback((rom: RomSummary, desired: boolean) => {
+    const romId = rom.id;
+    const sessionGeneration = favoriteSessionGeneration.current;
+    const previousFavorite = favoriteValues.current.get(romId) ?? rom.user.favorite;
+    if (!favoriteAuthoritativeValues.current.has(romId)) {
+      favoriteAuthoritativeValues.current.set(romId, previousFavorite);
+    }
+    const revision = (favoriteMutationRevisions.current.get(romId) ?? 0) + 1;
+    favoriteMutationRevisions.current.set(romId, revision);
+    favoritePendingRomIds.current.add(romId);
+    setFavoriteFailure(null);
+    applyFavoriteEverywhere(
+      rom,
+      desired,
+      favoriteQueuedDesiredValues.current.has(romId),
+    );
+    setFavoritePendingIds((current) => new Set(current).add(romId));
+
+    void favoriteMutationQueue.current.enqueue(romId, async () => {
+      let authoritativeFavorite: boolean | null = null;
+      let queuedFavorite: boolean | null = null;
+      let failure: AppError | null = null;
+      try {
+        const response = await requestAgent({ type: "setFavorite", romId, desired });
+        if (response.type === "favoriteUpdated" && response.result.romId === romId) {
+          authoritativeFavorite = response.result.favorite;
+        } else if (response.type === "favoriteQueued" && response.mutation.romId === romId) {
+          queuedFavorite = response.mutation.desired;
+        } else if (response.type === "error") {
+          failure = response.error;
+        } else {
+          failure = {
+            code: "favorite_update_failed",
+            message: "RomM returned an unexpected response while updating this favorite.",
+            retryable: true,
+          };
+        }
+      } catch (error) {
+        failure = {
+          code: "favorite_update_failed",
+          message: error instanceof Error ? error.message : String(error),
+          retryable: true,
+        };
+      }
+
+      if (favoriteSessionGeneration.current !== sessionGeneration) return;
+
+      const isLatest = favoriteMutationRevisions.current.get(romId) === revision;
+      if (authoritativeFavorite !== null) {
+        favoriteAuthoritativeValues.current.set(romId, authoritativeFavorite);
+        favoriteQueuedDesiredValues.current.delete(romId);
+      } else if (queuedFavorite !== null) {
+        favoriteQueuedDesiredValues.current.set(romId, queuedFavorite);
+      }
+      if (isLatest && failure) {
+        const queuedDesired = favoriteQueuedDesiredValues.current.get(romId);
+        const rollbackFavorite = queuedDesired ??
+          favoriteAuthoritativeValues.current.get(romId) ?? previousFavorite;
+        const rollbackQueued = queuedDesired !== undefined;
+        applyFavoriteEverywhere(rom, rollbackFavorite, rollbackQueued);
+        setFavoriteFailure({
+          rom: setRomFavorite(rom, rollbackFavorite, rollbackQueued),
+          desired,
+          error: failure,
+        });
+      } else if (isLatest && authoritativeFavorite !== null) {
+        applyFavoriteEverywhere(rom, authoritativeFavorite, false);
+      } else if (isLatest && queuedFavorite !== null) {
+        applyFavoriteEverywhere(rom, queuedFavorite, true);
+      }
+
+      if (isLatest) {
+        favoritePendingRomIds.current.delete(romId);
+        setFavoritePendingIds((current) => {
+          const next = new Set(current);
+          next.delete(romId);
+          return next;
+        });
+      }
+    });
+  }, [applyFavoriteEverywhere]);
+
+  const toggleFavoriteOptimistically = useCallback((rom: RomSummary) => {
+    const current = favoriteValues.current.get(rom.id) ?? rom.user.favorite;
+    setFavoriteOptimistically(rom, !current);
+  }, [setFavoriteOptimistically]);
 
   const selectLibraryTab = useCallback((tab: LibraryTab) => {
     if (busy !== null) return;
@@ -1088,6 +1437,15 @@ export default function App() {
         window.dispatchEvent(new CustomEvent(VIRTUAL_KEYBOARD_COMMAND_EVENT, {
           detail: "backspace",
         }));
+      } else if (payload.action === "back" && directoryBrowserTarget) {
+        if (directoryCreationOpen) {
+          setDirectoryCreationOpen(false);
+          setDirectoryName("");
+          setDirectoryBrowserError(null);
+          window.requestAnimationFrame(() => setFocus("DIRECTORY-NEW"));
+        } else if (!directoryBrowserBusy) {
+          closeDirectoryBrowser();
+        }
       } else if (payload.action === "back" && logoutDialogOpen) {
         closeLogoutDialog();
       } else if (payload.action === "back" && contextRom) {
@@ -1151,6 +1509,9 @@ export default function App() {
     closeKeyboard,
     contextRom,
     controllerSettingsOpen,
+    directoryBrowserBusy,
+    directoryBrowserTarget,
+    directoryCreationOpen,
     deviceSettingsOpen,
     deviceVerified,
     httpWarningOrigin,
@@ -1302,6 +1663,34 @@ export default function App() {
     });
   }, [onboardingState?.currentStep, primaryView, run]);
   useEffect(() => {
+    setMappingIssues([]);
+    setMappingPathChecks([]);
+  }, [mappingDrafts]);
+  useEffect(() => {
+    if (primaryView !== "mapping" || onboardingState?.currentStep !== "mappings") return;
+    if (!mappingDrafts.some((draft) => draft.enabled)) return;
+    let active = true;
+    const recheck = () => {
+      const drafts = normalizeMappingPaths(mappingDrafts);
+      void requestAgent({ type: "recheckMappings", drafts, noPlatforms: false })
+        .then((response) => {
+          if (!active || response.type !== "mappingValidation") return;
+          setMappingIssues(response.result.issues);
+          setMappingPathChecks(response.result.paths);
+        })
+        .catch(() => undefined);
+    };
+    const timer = window.setInterval(recheck, 15_000);
+    window.addEventListener("online", recheck);
+    window.addEventListener("focus", recheck);
+    return () => {
+      active = false;
+      window.clearInterval(timer);
+      window.removeEventListener("online", recheck);
+      window.removeEventListener("focus", recheck);
+    };
+  }, [mappingDrafts, onboardingState?.currentStep, primaryView]);
+  useEffect(() => {
     if (primaryView !== "refresh") {
       initialRefreshAttempted.current = false;
       return;
@@ -1401,8 +1790,19 @@ export default function App() {
         : "REGISTER-DEVICE"
       : "DEVICE-RECOVERY-ACTION";
   const libraryFirstContentFocusKey = libraryTabFocusKey(libraryTab);
+  const hasLibraryConstraints = librarySearch.trim().length > 0 ||
+    libraryFilters.platformId !== null ||
+    libraryFilters.collectionId !== null ||
+    libraryFilters.favoriteOnly ||
+    libraryFilters.downloadedOnly;
   const footerReturnFocusKey = primaryView === "library"
-    ? catalogViewActive ? libraryBottomFocusKey : libraryFirstContentFocusKey
+    ? catalogViewActive
+      ? libraryError
+        ? "LIBRARY-RETRY"
+        : filteredRoms.length === 0 && hasLibraryConstraints
+          ? "LIBRARY-EMPTY-CLEAR"
+          : libraryBottomFocusKey
+      : libraryFirstContentFocusKey
     : primaryView === "device"
       ? "DEVICE-SIGN-OUT"
       : primaryView === "mapping"
@@ -1438,7 +1838,13 @@ export default function App() {
   const libraryHeadingTitle = libraryTab === "home"
     ? "Home"
     : selectedPlatform?.name ?? selectedCollection?.name ?? LIBRARY_TAB_LABELS[libraryTab];
-
+  const librarySourceLabel = libraryProvenance?.source === "live"
+    ? "Live from RomM"
+    : libraryProvenance?.source === "local"
+      ? "On this device"
+      : libraryProvenance?.stale
+        ? "Offline cache · stale"
+        : "Offline cache";
   function refreshCurrentLibrary() {
     if (libraryTab === "home" || !catalogViewActive) {
       void loadLibraryHome();
@@ -1525,11 +1931,15 @@ export default function App() {
       }
       window.requestAnimationFrame(() => setFocus("PAIRING-CODE"));
     } else if (response?.type === "authenticated") {
+      const connectionReady = response.result.connectionState === "connected";
+      applyFavoriteReconciliation(response.result.favoriteReconciliation);
       setSignedOutLocally(false);
-      setConnected(true);
+      setConnected(connectionReady);
       setPairingCode("");
-      setNotice(response.result.warning ?? null);
+      setNotice(authenticationNotice(response.result));
       await onboarding.refetch();
+      await status.refetch();
+      if (!connectionReady) return;
       setDeviceResolved(false);
       await prepareDeviceRegistration();
     }
@@ -1540,11 +1950,15 @@ export default function App() {
       requestAgent({ type: "setManualToken", token: manualToken }),
     );
     if (response?.type === "authenticated") {
+      const connectionReady = response.result.connectionState === "connected";
+      applyFavoriteReconciliation(response.result.favoriteReconciliation);
       setSignedOutLocally(false);
-      setConnected(true);
+      setConnected(connectionReady);
       setManualToken("");
-      setNotice(response.result.warning ?? null);
+      setNotice(authenticationNotice(response.result));
       await onboarding.refetch();
+      await status.refetch();
+      if (!connectionReady) return;
       setDeviceResolved(false);
       await prepareDeviceRegistration();
     } else if (response?.type === "error") {
@@ -1556,10 +1970,17 @@ export default function App() {
     const response = await run("reconnect", () => requestAgent({ type: "reconnect" }));
     setRestoringCredential(false);
     if (response?.type === "authenticated") {
+      const connectionReady = response.result.connectionState === "connected";
+      applyFavoriteReconciliation(response.result.favoriteReconciliation);
       setSignedOutLocally(false);
-      setConnected(true);
-      setNotice(response.result.warning ?? null);
+      setConnected(connectionReady);
+      setNotice(authenticationNotice(response.result));
       await onboarding.refetch();
+      await status.refetch();
+      if (!connectionReady) {
+        if (!restoring) window.setTimeout(() => setFocus("RECONNECT"), 0);
+        return;
+      }
       setDeviceResolved(false);
       await prepareDeviceRegistration();
     } else if (!restoring) {
@@ -1601,6 +2022,111 @@ export default function App() {
     }
   }
 
+  async function browseDirectories(path?: string) {
+    setDirectoryBrowserBusy(true);
+    setDirectoryBrowserError(null);
+    try {
+      const response = await requestAgent({ type: "browseDirectories", path });
+      if (response.type === "directoryListing") {
+        setDirectoryListing(response.listing);
+        window.requestAnimationFrame(() => {
+          updateAllLayouts();
+          setFocus(
+            response.listing.currentPath
+              ? "DIRECTORY-USE"
+              : response.listing.entries.length > 0
+                ? "DIRECTORY-ENTRY-0"
+                : "DIRECTORY-CANCEL",
+          );
+        });
+      } else if (response.type === "error") {
+        setDirectoryBrowserError(response.error.message);
+      } else {
+        setDirectoryBrowserError("The agent returned an unexpected directory response.");
+      }
+    } catch (error) {
+      setDirectoryBrowserError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setDirectoryBrowserBusy(false);
+    }
+  }
+
+  function openDirectoryBrowser(
+    target: DirectoryBrowserTarget,
+    currentPath: string,
+  ) {
+    setDirectoryBrowserTarget(target);
+    setDirectoryListing(null);
+    setDirectoryBrowserError(null);
+    setDirectoryBrowserNotice(null);
+    setDirectoryCreationOpen(false);
+    setDirectoryName("");
+    void browseDirectories(currentPath.trim() || undefined);
+  }
+
+  function closeDirectoryBrowser() {
+    const returnFocusKey = directoryBrowserTarget?.returnFocusKey;
+    setDirectoryBrowserTarget(null);
+    setDirectoryListing(null);
+    setDirectoryBrowserError(null);
+    setDirectoryBrowserNotice(null);
+    setDirectoryCreationOpen(false);
+    setDirectoryName("");
+    if (returnFocusKey) window.requestAnimationFrame(() => setFocus(returnFocusKey));
+  }
+
+  function chooseBrowsedDirectory() {
+    const path = directoryListing?.currentPath;
+    if (!directoryBrowserTarget || !path) return;
+    setMappingDrafts((current) => updateMappingPathAt(
+      current,
+      directoryBrowserTarget.draftId,
+      directoryBrowserTarget.field,
+      directoryBrowserTarget.index,
+      path,
+    ));
+    setMappingIssues([]);
+    closeDirectoryBrowser();
+  }
+
+  async function createBrowsedDirectory() {
+    const parentPath = directoryListing?.currentPath;
+    const name = directoryName.trim();
+    if (!parentPath || !name) {
+      setDirectoryBrowserError("Enter one folder name before confirming creation.");
+      window.requestAnimationFrame(() => setFocus("DIRECTORY-NEW-NAME"));
+      return;
+    }
+    setDirectoryBrowserBusy(true);
+    setDirectoryBrowserError(null);
+    try {
+      const response = await requestAgent({
+        type: "createDirectory",
+        parentPath,
+        name,
+        confirmed: true,
+      });
+      if (response.type === "directoryCreated") {
+        setDirectoryCreationOpen(false);
+        setDirectoryName("");
+        setDirectoryBrowserNotice(
+          response.result.created
+            ? `Created ${response.result.path}. Review it, then choose Use this folder.`
+            : "That folder already existed. Review it, then choose Use this folder.",
+        );
+        await browseDirectories(response.result.path);
+      } else if (response.type === "error") {
+        setDirectoryBrowserError(response.error.message);
+      } else {
+        setDirectoryBrowserError("The agent returned an unexpected directory-creation response.");
+      }
+    } catch (error) {
+      setDirectoryBrowserError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setDirectoryBrowserBusy(false);
+    }
+  }
+
   async function scanMappings() {
     setMappingIssues([]);
     setNoPlatformsArmed(false);
@@ -1610,6 +2136,15 @@ export default function App() {
       setMappingEvidence(response.result.evidence);
       setMappingScanned(true);
       setShowAllMappingPlatforms(response.result.detectedCount === 0);
+      if (response.result.presetUpdates.length > 0) {
+        const preserved = response.result.presetUpdates.reduce(
+          (count, update) => count + update.preservedCustomFields.length,
+          0,
+        );
+        setNotice(
+          `${response.result.presetUpdates.length} mapping ${response.result.presetUpdates.length === 1 ? "preset was" : "presets were"} updated.${preserved > 0 ? ` ${preserved} custom ${preserved === 1 ? "field was" : "fields were"} preserved.` : ""}`,
+        );
+      }
       window.requestAnimationFrame(() => {
         updateAllLayouts();
         setFocus("REVIEW-MAPPINGS");
@@ -1635,14 +2170,15 @@ export default function App() {
   }
 
   async function saveReviewedMappings(noPlatforms: boolean) {
-    const drafts = noPlatforms
+    const drafts = normalizeMappingPaths(noPlatforms
       ? mappingDrafts.map((draft) => ({ ...draft, enabled: false }))
-      : mappingDrafts;
+      : mappingDrafts);
     const response = await run("mapping-save", () =>
       requestAgent({ type: "saveMappings", drafts, noPlatforms }),
     );
     if (response?.type === "mappingValidation") {
       setMappingIssues(response.result.issues);
+      setMappingPathChecks(response.result.paths);
       setMessage(response.result.issues[0]?.message ?? "Review the highlighted mapping.");
       const firstDraft = response.result.issues.find((issue) => issue.draftId)?.draftId;
       window.requestAnimationFrame(() => setFocus(firstDraft ? `MAPPING-TOGGLE-${firstDraft}` : "MAPPING-SEARCH"));
@@ -1656,6 +2192,22 @@ export default function App() {
       setNotice(noPlatforms
         ? "Setup will continue without local platform folders."
         : `${response.mappings.length} platform ${response.mappings.length === 1 ? "mapping" : "mappings"} saved.`);
+    }
+  }
+
+  async function recheckMappingSafety() {
+    const drafts = normalizeMappingPaths(mappingDrafts);
+    const response = await run("mapping-recheck", () =>
+      requestAgent({ type: "validateMappings", drafts, noPlatforms: false }),
+    );
+    if (response?.type !== "mappingValidation") return;
+    setMappingIssues(response.result.issues);
+    setMappingPathChecks(response.result.paths);
+    if (response.result.valid) {
+      setMessage(null);
+      setNotice(`${response.result.paths.length} configured ${response.result.paths.length === 1 ? "folder is" : "folders are"} available.`);
+    } else {
+      setMessage(response.result.issues[0]?.message ?? "One or more folders need attention.");
     }
   }
 
@@ -1904,6 +2456,7 @@ export default function App() {
     setGameDetailsError(null);
     setGameDetailsLoading(true);
     const requestNumber = ++gameDetailsRequestRef.current;
+    const favoriteRevisionAtRequest = favoriteMutationRevisions.current.get(rom.id) ?? 0;
     if (mappingDrafts.length === 0) {
       void requestAgent({ type: "getMappingDrafts" }).then((response) => {
         if (response.type === "mappingDrafts") setMappingDrafts(response.drafts);
@@ -1913,7 +2466,23 @@ export default function App() {
       .then((response) => {
         if (gameDetailsRequestRef.current !== requestNumber) return;
         if (response.type === "gameDetails" && response.details.rom.id === rom.id) {
-          setGameDetails(response.details);
+          const currentFavoriteRevision = favoriteMutationRevisions.current.get(rom.id) ?? 0;
+          const currentFavorite = favoriteValues.current.get(rom.id);
+          if (currentFavoriteRevision !== favoriteRevisionAtRequest && currentFavorite !== undefined) {
+            setGameDetails({
+              ...response.details,
+              rom: setRomFavorite(
+                response.details.rom,
+                currentFavorite,
+                favoriteQueuedDesiredValues.current.has(rom.id),
+              ),
+            });
+          } else {
+            setGameDetails({
+              ...response.details,
+              rom: reconcileLoadedFavorite(response.details.rom),
+            });
+          }
         } else if (response.type === "error") {
           setGameDetailsError(response.error.message);
         }
@@ -1926,7 +2495,7 @@ export default function App() {
       .finally(() => {
         if (gameDetailsRequestRef.current === requestNumber) setGameDetailsLoading(false);
       });
-    window.setTimeout(() => setFocus("CLOSE-GAME-CONTEXT"), 0);
+    window.setTimeout(() => setFocus("GAME-FAVORITE"), 0);
   }
 
   function closeGameContext() {
@@ -1995,6 +2564,18 @@ export default function App() {
       } : null);
       setRoms([]);
       romsRef.current = [];
+      setHomeShelves({ recent: [], favorites: [], downloaded: [], downloads: [] });
+      setHomeInitialized(false);
+      libraryCatalogsRef.current.clear();
+      favoriteSessionGeneration.current += 1;
+      favoriteMutationQueue.current = createPerRomMutationQueue();
+      favoriteMutationRevisions.current.clear();
+      favoriteValues.current.clear();
+      favoriteAuthoritativeValues.current.clear();
+      favoriteQueuedDesiredValues.current.clear();
+      favoritePendingRomIds.current.clear();
+      setFavoritePendingIds(new Set());
+      setFavoriteFailure(null);
       romTotalRef.current = null;
       setRomTotal(null);
       nextRomOffsetRef.current = 0;
@@ -2623,8 +3204,9 @@ export default function App() {
                       : "Find your ROM folders."}
                   </h2>
                   <p>
-                    Detection is read-only. RomM Companion will not create directories or touch
-                    ROMs, saves, or states during this step.
+                    {onboardingState?.currentStep === "mappings"
+                      ? "Browsing and editing do not change the filesystem. Creating one final folder requires a separate confirmation, and ROMs, saves, and states are never touched."
+                      : "Detection is read-only. RomM Companion will not create directories or touch ROMs, saves, or states during this step."}
                   </p>
                 </div>
                 <OnboardingProgress
@@ -2705,9 +3287,18 @@ export default function App() {
                       variant="quiet"
                       selected={showAllMappingPlatforms}
                       focusKey="MAPPING-SHOW-ALL"
-                      navigation={{ left: "MAPPING-SEARCH", down: visibleMappingDrafts[0] ? `MAPPING-TOGGLE-${visibleMappingDrafts[0].id}` : "SAVE-MAPPINGS" }}
+                      navigation={{ left: "MAPPING-SEARCH", right: "MAPPING-RECHECK", down: visibleMappingDrafts[0] ? `MAPPING-TOGGLE-${visibleMappingDrafts[0].id}` : "SAVE-MAPPINGS" }}
                     >
                       {showAllMappingPlatforms ? "Show selected" : "Show all platforms"}
+                    </FocusButton>
+                    <FocusButton
+                      onPress={() => void recheckMappingSafety()}
+                      variant="quiet"
+                      disabled={busy !== null || !mappingDrafts.some((draft) => draft.enabled)}
+                      focusKey="MAPPING-RECHECK"
+                      navigation={{ left: "MAPPING-SHOW-ALL", down: visibleMappingDrafts[0] ? `MAPPING-TOGGLE-${visibleMappingDrafts[0].id}` : "SAVE-MAPPINGS" }}
+                    >
+                      {busy === "mapping-recheck" ? "Checking folders…" : "Check folder safety"}
                     </FocusButton>
                     <span>{mappingDrafts.filter((draft) => draft.enabled).length} selected</span>
                   </div>
@@ -2715,6 +3306,7 @@ export default function App() {
                   <div className="mapping-review-list">
                     {visibleMappingDrafts.map((draft) => {
                       const issue = issueForDraft(mappingIssues, draft.id);
+                      const pathChecks = mappingPathChecks.filter((check) => check.draftId === draft.id);
                       return (
                         <section className={`mapping-review-card ${draft.enabled ? "is-enabled" : ""}`} key={draft.id}>
                           <div className="mapping-card-heading">
@@ -2723,10 +3315,10 @@ export default function App() {
                               <h3>{draft.platformName}</h3>
                             </div>
                             <FocusButton
-                              onPress={() => setMappingDrafts((current) => updateMappingDraft(
+                              onPress={() => setMappingDrafts((current) => updateMappingEnabled(
                                 current,
                                 draft.id,
-                                (candidate) => ({ ...candidate, enabled: !candidate.enabled }),
+                                !draft.enabled,
                               ))}
                               variant="quiet"
                               selected={draft.enabled}
@@ -2737,56 +3329,152 @@ export default function App() {
                           </div>
                           {draft.enabled && (
                             <div className="mapping-card-fields">
-                              <FocusInput
-                                label="ROM folder"
-                                value={draft.romRoot}
-                                onChange={(value) => setMappingDrafts((current) => updateMappingPath(current, draft.id, "romRoot", value))}
-                                placeholder="Absolute existing directory"
-                                inputMode="text"
-                                focusKey={`MAPPING-ROM-${draft.id}`}
-                                onOpenKeyboard={() => setKeyboard({
-                                  focusKey: `MAPPING-ROM-${draft.id}`,
-                                  label: `${draft.platformName} ROM folder`,
-                                  value: draft.romRoot,
-                                  mode: "text",
-                                  commit: (value) => setMappingDrafts((current) => updateMappingPath(current, draft.id, "romRoot", value)),
-                                })}
-                              />
-                              <FocusInput
-                                label="Save folder (optional)"
-                                value={draft.saveRoots[0] ?? ""}
-                                onChange={(value) => setMappingDrafts((current) => updateMappingPath(current, draft.id, "saveRoots", value))}
-                                placeholder="Absolute existing directory"
-                                inputMode="text"
-                                focusKey={`MAPPING-SAVE-${draft.id}`}
-                                onOpenKeyboard={() => setKeyboard({
-                                  focusKey: `MAPPING-SAVE-${draft.id}`,
-                                  label: `${draft.platformName} save folder`,
-                                  value: draft.saveRoots[0] ?? "",
-                                  mode: "text",
-                                  commit: (value) => setMappingDrafts((current) => updateMappingPath(current, draft.id, "saveRoots", value)),
-                                })}
-                              />
-                              <FocusInput
-                                label="State folder (optional)"
-                                value={draft.stateRoots[0] ?? ""}
-                                onChange={(value) => setMappingDrafts((current) => updateMappingPath(current, draft.id, "stateRoots", value))}
-                                placeholder="Absolute existing directory"
-                                inputMode="text"
-                                focusKey={`MAPPING-STATE-${draft.id}`}
-                                onOpenKeyboard={() => setKeyboard({
-                                  focusKey: `MAPPING-STATE-${draft.id}`,
-                                  label: `${draft.platformName} state folder`,
-                                  value: draft.stateRoots[0] ?? "",
-                                  mode: "text",
-                                  commit: (value) => setMappingDrafts((current) => updateMappingPath(current, draft.id, "stateRoots", value)),
-                                })}
-                              />
+                              <div className="mapping-path-group">
+                                <div className="mapping-path-row">
+                                  <FocusInput
+                                    label="ROM folder"
+                                    value={draft.romRoot}
+                                    onChange={(value) => setMappingDrafts((current) => updateMappingPath(current, draft.id, "romRoot", value))}
+                                    placeholder="Absolute existing directory"
+                                    inputMode="text"
+                                    focusKey={`MAPPING-ROM-${draft.id}`}
+                                    onOpenKeyboard={() => setKeyboard({
+                                      focusKey: `MAPPING-ROM-${draft.id}`,
+                                      label: `${draft.platformName} ROM folder`,
+                                      value: draft.romRoot,
+                                      mode: "text",
+                                      commit: (value) => setMappingDrafts((current) => updateMappingPath(current, draft.id, "romRoot", value)),
+                                    })}
+                                  />
+                                  <FocusButton
+                                    onPress={() => openDirectoryBrowser({
+                                      draftId: draft.id,
+                                      platformName: draft.platformName,
+                                      field: "romRoot",
+                                      index: 0,
+                                      returnFocusKey: `MAPPING-ROM-BROWSE-${draft.id}`,
+                                    }, draft.romRoot)}
+                                    variant="quiet"
+                                    focusKey={`MAPPING-ROM-BROWSE-${draft.id}`}
+                                  >
+                                    Browse
+                                  </FocusButton>
+                                </div>
+                              </div>
+                              <div className="mapping-path-group">
+                                {(draft.saveRoots.length > 0 ? draft.saveRoots : [""]).map((path, index) => (
+                                  <div className="mapping-path-row" key={`save-${index}`}>
+                                    <FocusInput
+                                      label={`Save folder ${index + 1} (optional)`}
+                                      value={path}
+                                      onChange={(value) => setMappingDrafts((current) => updateMappingPathAt(current, draft.id, "saveRoots", index, value))}
+                                      placeholder="Absolute existing directory"
+                                      inputMode="text"
+                                      focusKey={`MAPPING-SAVE-${draft.id}-${index}`}
+                                      onOpenKeyboard={() => setKeyboard({
+                                        focusKey: `MAPPING-SAVE-${draft.id}-${index}`,
+                                        label: `${draft.platformName} save folder ${index + 1}`,
+                                        value: path,
+                                        mode: "text",
+                                        commit: (value) => setMappingDrafts((current) => updateMappingPathAt(current, draft.id, "saveRoots", index, value)),
+                                      })}
+                                    />
+                                    <FocusButton
+                                      onPress={() => openDirectoryBrowser({
+                                        draftId: draft.id,
+                                        platformName: draft.platformName,
+                                        field: "saveRoots",
+                                        index,
+                                        returnFocusKey: `MAPPING-SAVE-BROWSE-${draft.id}-${index}`,
+                                      }, path)}
+                                      variant="quiet"
+                                      focusKey={`MAPPING-SAVE-BROWSE-${draft.id}-${index}`}
+                                    >
+                                      Browse
+                                    </FocusButton>
+                                    {draft.saveRoots.length > 0 && (
+                                      <FocusButton
+                                        onPress={() => setMappingDrafts((current) => removeMappingPath(current, draft.id, "saveRoots", index))}
+                                        variant="quiet"
+                                        focusKey={`MAPPING-SAVE-REMOVE-${draft.id}-${index}`}
+                                        ariaLabel={`Remove ${draft.platformName} save folder ${index + 1}`}
+                                      >
+                                        Remove
+                                      </FocusButton>
+                                    )}
+                                  </div>
+                                ))}
+                                <FocusButton
+                                  onPress={() => {
+                                    const index = draft.saveRoots.length;
+                                    if (index > 0) setMappingDrafts((current) => addMappingPath(current, draft.id, "saveRoots"));
+                                    window.requestAnimationFrame(() => setFocus(`MAPPING-SAVE-${draft.id}-${index}`));
+                                  }}
+                                  variant="quiet"
+                                  focusKey={`MAPPING-SAVE-ADD-${draft.id}`}
+                                >
+                                  Add save folder
+                                </FocusButton>
+                              </div>
+                              <div className="mapping-path-group">
+                                {(draft.stateRoots.length > 0 ? draft.stateRoots : [""]).map((path, index) => (
+                                  <div className="mapping-path-row" key={`state-${index}`}>
+                                    <FocusInput
+                                      label={`State folder ${index + 1} (optional)`}
+                                      value={path}
+                                      onChange={(value) => setMappingDrafts((current) => updateMappingPathAt(current, draft.id, "stateRoots", index, value))}
+                                      placeholder="Absolute existing directory"
+                                      inputMode="text"
+                                      focusKey={`MAPPING-STATE-${draft.id}-${index}`}
+                                      onOpenKeyboard={() => setKeyboard({
+                                        focusKey: `MAPPING-STATE-${draft.id}-${index}`,
+                                        label: `${draft.platformName} state folder ${index + 1}`,
+                                        value: path,
+                                        mode: "text",
+                                        commit: (value) => setMappingDrafts((current) => updateMappingPathAt(current, draft.id, "stateRoots", index, value)),
+                                      })}
+                                    />
+                                    <FocusButton
+                                      onPress={() => openDirectoryBrowser({
+                                        draftId: draft.id,
+                                        platformName: draft.platformName,
+                                        field: "stateRoots",
+                                        index,
+                                        returnFocusKey: `MAPPING-STATE-BROWSE-${draft.id}-${index}`,
+                                      }, path)}
+                                      variant="quiet"
+                                      focusKey={`MAPPING-STATE-BROWSE-${draft.id}-${index}`}
+                                    >
+                                      Browse
+                                    </FocusButton>
+                                    {draft.stateRoots.length > 0 && (
+                                      <FocusButton
+                                        onPress={() => setMappingDrafts((current) => removeMappingPath(current, draft.id, "stateRoots", index))}
+                                        variant="quiet"
+                                        focusKey={`MAPPING-STATE-REMOVE-${draft.id}-${index}`}
+                                        ariaLabel={`Remove ${draft.platformName} state folder ${index + 1}`}
+                                      >
+                                        Remove
+                                      </FocusButton>
+                                    )}
+                                  </div>
+                                ))}
+                                <FocusButton
+                                  onPress={() => {
+                                    const index = draft.stateRoots.length;
+                                    if (index > 0) setMappingDrafts((current) => addMappingPath(current, draft.id, "stateRoots"));
+                                    window.requestAnimationFrame(() => setFocus(`MAPPING-STATE-${draft.id}-${index}`));
+                                  }}
+                                  variant="quiet"
+                                  focusKey={`MAPPING-STATE-ADD-${draft.id}`}
+                                >
+                                  Add state folder
+                                </FocusButton>
+                              </div>
                               <FocusButton
-                                onPress={() => setMappingDrafts((current) => updateMappingDraft(
+                                onPress={() => setMappingDrafts((current) => updateMappingArchivePolicy(
                                   current,
                                   draft.id,
-                                  (candidate) => ({ ...candidate, archivePolicy: cycleArchivePolicy(candidate.archivePolicy) }),
                                 ))}
                                 variant="secondary"
                                 focusKey={`MAPPING-ARCHIVE-${draft.id}`}
@@ -2794,6 +3482,19 @@ export default function App() {
                                 Archive: {ARCHIVE_POLICY_LABELS[draft.archivePolicy]}
                               </FocusButton>
                             </div>
+                          )}
+                          {pathChecks.length > 0 && (
+                            <ul className="mapping-path-health" aria-label={`${draft.platformName} folder safety`}>
+                              {pathChecks.map((check) => (
+                                <li className={`is-${check.status}`} key={`${check.field}-${check.path}`}>
+                                  <span>{check.field === "romRoot" ? "ROM" : check.field.startsWith("saveRoots") ? "Save" : "State"}</span>
+                                  <strong>{check.status === "ready" ? "Ready" : check.status === "temporarily_unavailable" ? "Storage unavailable" : check.status === "permission_denied" ? "Access denied" : "Unsafe overlap"}</strong>
+                                  {check.availableBytes !== undefined && <small>{formatBytes(check.availableBytes)} free</small>}
+                                  {check.removable && <small>Removable storage</small>}
+                                  {check.containsSymlink && <small>Linked path → {check.canonicalPath}</small>}
+                                </li>
+                              ))}
+                            </ul>
                           )}
                           {issue && <p className="mapping-card-issue" role="alert">{issue.message}</p>}
                         </section>
@@ -3132,6 +3833,8 @@ export default function App() {
                               index={index}
                               focusKey={`HOME-${shelf.toUpperCase()}-ROM-${rom.id}`}
                               onOpen={openGameContext}
+                              onToggleFavorite={toggleFavoriteOptimistically}
+                              favoritePending={favoritePendingIds.has(rom.id)}
                             />
                           ))}
                         </div>
@@ -3202,11 +3905,15 @@ export default function App() {
                   focusKey="LIBRARY-SEARCH"
                   navigation={{
                     up: "REFRESH",
-                    down: filteredRoms[0]
-                      ? `ROM-${filteredRoms[0].id}`
-                      : hasMoreRoms
-                        ? "LOAD-MORE"
-                        : "CLOSE-TO-TRAY",
+                    down: libraryError
+                      ? "LIBRARY-RETRY"
+                      : filteredRoms[0]
+                        ? `ROM-${filteredRoms[0].id}`
+                        : hasMoreRoms
+                          ? "LOAD-MORE"
+                          : hasLibraryConstraints
+                            ? "LIBRARY-EMPTY-CLEAR"
+                            : "CLOSE-TO-TRAY",
                   }}
                   onOpenKeyboard={() => setKeyboard({
                     focusKey: "LIBRARY-SEARCH",
@@ -3278,6 +3985,9 @@ export default function App() {
                   <span><strong>{restoredAgentStatus.accountName}</strong> · token #{restoredAgentStatus.tokenId}</span>
                   <span>RomM {restoredAgentStatus.serverVersion ?? "5.x"}</span>
                   <span>{restoredAgentStatus.grantedScopes.length} permissions verified</span>
+                  {restoredAgentStatus.pendingFavoriteCount > 0 && (
+                    <span>{restoredAgentStatus.pendingFavoriteCount} favorite {restoredAgentStatus.pendingFavoriteCount === 1 ? "change" : "changes"} queued</span>
+                  )}
                   {restoredAgentStatus.lastContactAtMs && (
                     <span>Last contact {new Date(restoredAgentStatus.lastContactAtMs).toLocaleString()}</span>
                   )}
@@ -3289,11 +3999,15 @@ export default function App() {
                       focusKey="PERMISSION-DISCLOSURE"
                       navigation={{
                         up: catalogViewActive ? "LIBRARY-SEARCH" : libraryFirstContentFocusKey,
-                        down: filteredRoms[0]
-                          ? `ROM-${filteredRoms[0].id}`
-                          : hasMoreRoms
-                            ? "LOAD-MORE"
-                            : "CLOSE-TO-TRAY",
+                        down: libraryError
+                          ? "LIBRARY-RETRY"
+                          : filteredRoms[0]
+                            ? `ROM-${filteredRoms[0].id}`
+                            : hasMoreRoms
+                              ? "LOAD-MORE"
+                              : hasLibraryConstraints
+                                ? "LIBRARY-EMPTY-CLEAR"
+                                : "CLOSE-TO-TRAY",
                       }}
                     >
                       {permissionDetailsOpen ? "Hide permission details" : "Permission details"}
@@ -3306,15 +4020,67 @@ export default function App() {
                   </div>
                 </div>
               )}
-              {message && <p className="error-banner" role="alert">{message}</p>}
+              {message && !libraryError && <p className="error-banner" role="alert">{message}</p>}
+              {libraryProvenance && (
+                <div className={`library-source ${libraryProvenance.source}`} role="status">
+                  <strong>{librarySourceLabel}</strong>
+                  <span>Updated {new Date(libraryProvenance.refreshedAtMs).toLocaleString()}</span>
+                </div>
+              )}
               {librarySourceNotice && (
                 <p className="notice-banner" role="status">{librarySourceNotice}</p>
               )}
+              {libraryError && (
+                <div className="library-error-state" role="alert">
+                  <div>
+                    <strong>Library refresh failed</strong>
+                    <p>{libraryError.message}</p>
+                    {roms.length > 0 && <p>Your last available library remains visible.</p>}
+                  </div>
+                  <FocusButton
+                    onPress={refreshCurrentLibrary}
+                    variant="secondary"
+                    disabled={busy !== null}
+                    focusKey="LIBRARY-RETRY"
+                    navigation={{
+                      up: catalogViewActive ? "LIBRARY-SEARCH" : libraryFirstContentFocusKey,
+                      down: filteredRoms[0] ? `ROM-${filteredRoms[0].id}` : "CLOSE-TO-TRAY",
+                    }}
+                  >
+                    {busy ? "Retrying…" : "Retry"}
+                  </FocusButton>
+                </div>
+              )}
               {notice && <p className="notice-banner" role="status">{notice}</p>}
+              {favoriteFailure && !contextRom && (
+                <div className="favorite-error-state" role="alert">
+                  <div>
+                    <strong>Favorite was not changed</strong>
+                    <p>{favoriteFailure.error.message}</p>
+                  </div>
+                  <FocusButton
+                    onPress={() => setFavoriteOptimistically(
+                      favoriteFailure.rom,
+                      favoriteFailure.desired,
+                    )}
+                    variant="secondary"
+                    focusKey="RETRY-FAVORITE"
+                  >
+                    Retry
+                  </FocusButton>
+                </div>
+              )}
               {catalogViewActive && <>
               <div className={`rom-grid ${!libraryInitialized ? "is-loading" : ""}`}>
                 {filteredRoms.map((rom, index) => (
-                  <RomCard key={rom.id} rom={rom} index={index} onOpen={openGameContext} />
+                  <RomCard
+                    key={rom.id}
+                    rom={rom}
+                    index={index}
+                    onOpen={openGameContext}
+                    onToggleFavorite={toggleFavoriteOptimistically}
+                    favoritePending={favoritePendingIds.has(rom.id)}
+                  />
                 ))}
               </div>
               {!libraryInitialized && (
@@ -3342,18 +4108,224 @@ export default function App() {
                   <p>More games load automatically as you scroll.</p>
                 </div>
               )}
-              {libraryInitialized && !busy && roms.length === 0 && (
+              {libraryInitialized && !busy && !libraryError && roms.length === 0 && (
                 <div className="empty-state">
-                  <h3>{libraryQuery.kind === "active_downloads" ? "No active downloads" : libraryQuery.kind === "downloaded" ? "No downloaded games" : "No games in this view"}</h3>
+                  <h3>{hasLibraryConstraints ? "No games match these filters" : libraryQuery.kind === "active_downloads" ? "No active downloads" : libraryQuery.kind === "downloaded" ? "No downloaded games" : "No games in this view"}</h3>
                   <p>{libraryQuery.kind === "active_downloads"
                     ? "Queued and running transfers will appear here once downloads are implemented."
                     : libraryQuery.kind === "downloaded"
                       ? "Games with a tracked local copy will appear here."
-                      : "RomM connected successfully, but this view is empty."}</p>
+                      : hasLibraryConstraints
+                        ? "Try clearing the current search and filters."
+                        : "RomM connected successfully, but this view is empty."}</p>
+                  {hasLibraryConstraints && (
+                    <FocusButton
+                      onPress={clearLibraryFilters}
+                      variant="quiet"
+                      focusKey="LIBRARY-EMPTY-CLEAR"
+                      navigation={{ up: "LIBRARY-SEARCH", down: "CLOSE-TO-TRAY" }}
+                    >
+                      Clear search and filters
+                    </FocusButton>
+                  )}
                 </div>
               )}
               </>}
             </FocusScreen>
+          )}
+        </AnimatePresence>
+
+        <AnimatePresence>
+          {directoryBrowserTarget && (
+            <motion.div
+              className="dialog-backdrop"
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
+              onPointerDown={(event) => {
+                if (event.target === event.currentTarget && !directoryBrowserBusy) {
+                  closeDirectoryBrowser();
+                }
+              }}
+            >
+              <FocusDialog
+                boundaryKey="DIRECTORY-BROWSER-DIALOG"
+                initialFocusKey="DIRECTORY-CANCEL"
+                className="settings-dialog directory-browser-dialog"
+                labelledBy="directory-browser-title"
+                onDismiss={closeDirectoryBrowser}
+              >
+                <p className="eyebrow accent">Platform mapping</p>
+                <h2 id="directory-browser-title">
+                  Choose {directoryBrowserTarget.platformName} {
+                    directoryBrowserTarget.field === "romRoot"
+                      ? "ROM folder"
+                      : directoryBrowserTarget.field === "saveRoots"
+                        ? "save folder"
+                        : "state folder"
+                  }
+                </h2>
+                <p>
+                  Browse with the controller or mouse. Selecting a folder only updates this draft;
+                  no ROM, save, or state files are changed.
+                </p>
+                <div className="directory-current-path" aria-live="polite">
+                  <span>{directoryListing?.locations ? "Locations" : "Current folder"}</span>
+                  <code>{directoryListing?.currentPath ?? "Choose a location"}</code>
+                </div>
+                <div className="directory-browser-toolbar">
+                  {!directoryListing?.locations && (
+                    <FocusButton
+                      onPress={() => void browseDirectories()}
+                      variant="quiet"
+                      disabled={directoryBrowserBusy}
+                      focusKey="DIRECTORY-LOCATIONS"
+                    >
+                      Locations
+                    </FocusButton>
+                  )}
+                  {directoryListing?.parentPath && (
+                    <FocusButton
+                      onPress={() => void browseDirectories(directoryListing.parentPath)}
+                      variant="quiet"
+                      disabled={directoryBrowserBusy}
+                      focusKey="DIRECTORY-UP"
+                    >
+                      Up one folder
+                    </FocusButton>
+                  )}
+                  {directoryListing?.currentPath && (
+                    <FocusButton
+                      onPress={chooseBrowsedDirectory}
+                      variant="primary"
+                      disabled={directoryBrowserBusy}
+                      focusKey="DIRECTORY-USE"
+                    >
+                      Use this folder
+                    </FocusButton>
+                  )}
+                </div>
+                {directoryBrowserBusy && (
+                  <div className="library-loading compact" role="status">
+                    <span className="loading-pulse" /> Reading folders…
+                  </div>
+                )}
+                {!directoryBrowserBusy && directoryListing && (
+                  <div className="directory-entry-list" aria-label="Directories">
+                    {directoryListing.entries.map((entry, index) => (
+                      <FocusButton
+                        key={entry.path}
+                        onPress={() => void browseDirectories(entry.path)}
+                        variant="quiet"
+                        focusKey={`DIRECTORY-ENTRY-${index}`}
+                        ariaLabel={`Open ${entry.name}`}
+                      >
+                        <span aria-hidden="true">▸</span>
+                        <span>{entry.name}</span>
+                        {entry.isSymlink && <small>Linked folder</small>}
+                      </FocusButton>
+                    ))}
+                    {directoryListing.entries.length === 0 && (
+                      <p className="directory-empty">This folder contains no subfolders.</p>
+                    )}
+                    {directoryListing.truncated && (
+                      <p className="directory-limit" role="status">
+                        Showing the first 500 folders. Type a more specific path if needed.
+                      </p>
+                    )}
+                  </div>
+                )}
+                {directoryBrowserError && (
+                  <p className="error-banner" role="alert">{directoryBrowserError}</p>
+                )}
+                {directoryBrowserNotice && !directoryBrowserError && (
+                  <p className="notice-banner" role="status">{directoryBrowserNotice}</p>
+                )}
+                {directoryCreationOpen ? (
+                  <div className="directory-create-confirmation" role="alertdialog" aria-label="Confirm new folder">
+                    <p>
+                      Create one folder inside <code>{directoryListing?.currentPath}</code>. Parent
+                      folders will never be created automatically.
+                    </p>
+                    <FocusInput
+                      label="New folder name"
+                      value={directoryName}
+                      onChange={setDirectoryName}
+                      placeholder="Folder name"
+                      inputMode="text"
+                      maxLength={128}
+                      focusKey="DIRECTORY-NEW-NAME"
+                      disabled={directoryBrowserBusy}
+                      onOpenKeyboard={() => setKeyboard({
+                        focusKey: "DIRECTORY-NEW-NAME",
+                        label: "New folder name",
+                        value: directoryName,
+                        mode: "text",
+                        maxLength: 128,
+                        commit: setDirectoryName,
+                      })}
+                    />
+                    <div className="dialog-actions">
+                      <FocusButton
+                        onPress={() => void createBrowsedDirectory()}
+                        variant="primary"
+                        disabled={directoryBrowserBusy || !directoryName.trim()}
+                        focusKey="DIRECTORY-CREATE-CONFIRM"
+                      >
+                        {directoryBrowserBusy ? "Creating…" : "Confirm and create"}
+                      </FocusButton>
+                      <FocusButton
+                        onPress={() => {
+                          setDirectoryCreationOpen(false);
+                          setDirectoryName("");
+                          setDirectoryBrowserError(null);
+                          window.requestAnimationFrame(() => setFocus("DIRECTORY-NEW"));
+                        }}
+                        variant="quiet"
+                        disabled={directoryBrowserBusy}
+                        focusKey="DIRECTORY-CREATE-CANCEL"
+                      >
+                        Cancel creation
+                      </FocusButton>
+                    </div>
+                  </div>
+                ) : directoryListing?.currentPath && (
+                  <FocusButton
+                    onPress={() => {
+                      setDirectoryCreationOpen(true);
+                      setDirectoryBrowserError(null);
+                      setDirectoryBrowserNotice(null);
+                      window.requestAnimationFrame(() => setFocus("DIRECTORY-NEW-NAME"));
+                    }}
+                    variant="secondary"
+                    disabled={directoryBrowserBusy}
+                    focusKey="DIRECTORY-NEW"
+                  >
+                    Create a folder here…
+                  </FocusButton>
+                )}
+                <div className="dialog-actions">
+                  {directoryBrowserError && (
+                    <FocusButton
+                      onPress={() => void browseDirectories(directoryListing?.currentPath)}
+                      variant="secondary"
+                      disabled={directoryBrowserBusy}
+                      focusKey="DIRECTORY-RETRY"
+                    >
+                      Retry
+                    </FocusButton>
+                  )}
+                  <FocusButton
+                    onPress={closeDirectoryBrowser}
+                    variant="quiet"
+                    disabled={directoryBrowserBusy}
+                    focusKey="DIRECTORY-CANCEL"
+                  >
+                    Cancel
+                  </FocusButton>
+                </div>
+              </FocusDialog>
+            </motion.div>
           )}
         </AnimatePresence>
 
@@ -3598,7 +4570,7 @@ export default function App() {
             >
               <FocusDialog
                 boundaryKey="GAME-CONTEXT-DIALOG"
-                initialFocusKey="CLOSE-GAME-CONTEXT"
+                initialFocusKey="GAME-FAVORITE"
                 className="logout-dialog game-context-dialog"
                 labelledBy="game-context-title"
                 onDismiss={closeGameContext}
@@ -3607,8 +4579,8 @@ export default function App() {
                 <h2 id="game-context-title">{contextRom.title}</h2>
                 <p className="game-context-platform">{contextRom.platform}</p>
                 <div className="game-detail-layout">
-                  <div className="game-detail-cover cover-placeholder" aria-label={`Artwork placeholder for ${contextRom.title}`}>
-                    <span>{contextRom.title.slice(0, 1).toUpperCase()}</span>
+                  <div className="game-detail-cover">
+                    <RomArtwork rom={gameDetails?.rom ?? contextRom} large />
                   </div>
                   <div className="game-detail-overview">
                     <p>{gameDetails?.rom.summary ?? contextRom.summary ?? "RomM has no summary for this game."}</p>
@@ -3627,6 +4599,24 @@ export default function App() {
                 </div>
                 {gameDetailsLoading && <div className="library-loading compact" role="status"><span className="loading-pulse" /> Loading complete metadata…</div>}
                 {gameDetailsError && <p className="error-banner" role="alert">{gameDetailsError}</p>}
+                {favoriteFailure?.rom.id === contextRom.id && (
+                  <div className="favorite-error-state compact" role="alert">
+                    <div>
+                      <strong>Favorite was not changed</strong>
+                      <p>{favoriteFailure.error.message}</p>
+                    </div>
+                    <FocusButton
+                      onPress={() => setFavoriteOptimistically(
+                        favoriteFailure.rom,
+                        favoriteFailure.desired,
+                      )}
+                      variant="secondary"
+                      focusKey="RETRY-GAME-FAVORITE"
+                    >
+                      Retry
+                    </FocusButton>
+                  </div>
+                )}
                 {gameDetails && (
                   <div className="game-detail-sections">
                     {gameDetails.source === "cache" && (
@@ -3656,8 +4646,23 @@ export default function App() {
                   </div>
                 )}
                 <div className="dialog-actions">
-                  <FocusButton onPress={() => undefined} variant="quiet" disabled focusKey="GAME-FAVORITE-DEFERRED">
-                    Favorite editing - Feature 7
+                  <FocusButton
+                    onPress={() => {
+                      const current = gameDetails?.rom ?? contextRom;
+                      toggleFavoriteOptimistically(current);
+                    }}
+                    variant={(gameDetails?.rom.user.favorite ?? contextRom.user.favorite) ? "secondary" : "quiet"}
+                    selected={gameDetails?.rom.user.favorite ?? contextRom.user.favorite}
+                    focusKey="GAME-FAVORITE"
+                  >
+                    {favoritePendingIds.has(contextRom.id) ? "Saving · " : ""}
+                    {!favoritePendingIds.has(contextRom.id) &&
+                      (gameDetails?.rom.user.favoritePending ?? contextRom.user.favoritePending)
+                      ? "Queued · "
+                      : ""}
+                    {(gameDetails?.rom.user.favorite ?? contextRom.user.favorite)
+                      ? "★ Remove from favorites"
+                      : "☆ Add to favorites"}
                   </FocusButton>
                   <FocusButton onPress={() => undefined} variant="quiet" disabled focusKey="GAME-DOWNLOAD-DEFERRED">
                     Download - Feature 9

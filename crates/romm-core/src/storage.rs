@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     env, fs,
     path::{Path, PathBuf},
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -8,9 +9,10 @@ use std::{
 use fs2::FileExt;
 use romm_ipc::{
     ArchivePolicy, ArtworkKind, CollectionKind, DeviceIdentity, DevicePlatform,
-    DeviceRegistrationState, DeviceSyncMode, GameDetails, LibraryMetadata, LibraryQuery,
-    LibrarySort, LibrarySource, LibraryViewKind, LocalGameStatus, MappingSource, OnboardingState,
-    PlatformMappingDraft, RomPage, RomSummary,
+    DeviceRegistrationState, DeviceSyncMode, FavoriteMutationResult, GameDetails,
+    LibraryCollection, LibraryMetadata, LibraryQuery, LibrarySort, LibrarySource, LibraryViewKind,
+    LocalGameStatus, MappingSource, OnboardingState, PendingFavoriteMutation, PlatformMappingDraft,
+    RomPage, RomSummary, UserRomState,
 };
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 #[cfg(unix)]
@@ -18,6 +20,16 @@ use std::fs::{File, OpenOptions};
 use thiserror::Error;
 
 pub const LIBRARY_STALE_AFTER_MS: i64 = 24 * 60 * 60 * 1_000;
+pub const DEFAULT_ARTWORK_CACHE_BUDGET_BYTES: u64 = 1024 * 1024 * 1024;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CacheEntryRecord {
+    pub key: String,
+    pub local_path: PathBuf,
+    pub size_bytes: u64,
+    pub etag: Option<String>,
+    pub last_accessed_at_ms: i64,
+}
 
 const INITIAL_SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -241,6 +253,10 @@ impl AppPaths {
 
     pub fn certificates_dir(&self) -> PathBuf {
         self.config_dir.join("certificates")
+    }
+
+    pub fn artwork_cache_dir(&self) -> PathBuf {
+        self.cache_dir.join("artwork")
     }
 
     pub fn save_ca_certificate(&self, bytes: &[u8]) -> Result<String, StorageError> {
@@ -702,18 +718,58 @@ impl Database {
         self.set_app_state("mapping_draft_origin", server_origin)
     }
 
+    pub fn load_platform_mappings(
+        &self,
+        server_origin: &str,
+    ) -> Result<Vec<PlatformMappingDraft>, StorageError> {
+        let mut statement = self.connection.prepare(
+            r#"SELECT id, romm_platform_id, platform_name, platform_slug, enabled,
+                      rom_root, save_roots_json, state_roots_json, archive_policy,
+                      filename_strategy, source, preset_id, preset_version, custom_fields_json
+               FROM platform_mapping
+               WHERE server_origin = ?1 AND superseded = 0
+               ORDER BY platform_name COLLATE NOCASE, romm_platform_id"#,
+        )?;
+        let mappings = statement
+            .query_map([server_origin], |row| {
+                Ok(PlatformMappingDraft {
+                    id: row.get(0)?,
+                    platform_id: row.get(1)?,
+                    platform_name: row.get(2)?,
+                    platform_slug: row.get(3)?,
+                    enabled: row.get::<_, i64>(4)? != 0,
+                    rom_root: row.get(5)?,
+                    save_roots: json_mapping_column(row, 6, "save_roots_json")?,
+                    state_roots: json_mapping_column(row, 7, "state_roots_json")?,
+                    archive_policy: archive_policy_from_str(&row.get::<_, String>(8)?)?,
+                    filename_strategy: row.get(9)?,
+                    source: mapping_source_from_str(&row.get::<_, String>(10)?)?,
+                    preset_id: row.get(11)?,
+                    preset_version: row.get(12)?,
+                    custom_fields: json_mapping_column(row, 13, "custom_fields_json")?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(mappings)
+    }
+
     pub fn save_platform_mappings(
         &self,
         server_origin: &str,
         drafts: &[PlatformMappingDraft],
         no_platforms: bool,
     ) -> Result<(), StorageError> {
+        let draft_json =
+            serde_json::to_string(drafts).map_err(|error| StorageError::InvalidAppState {
+                key: "mapping_drafts".to_owned(),
+                message: error.to_string(),
+            })?;
         let transaction = self.connection.unchecked_transaction()?;
         let updated_at_ms = now_ms();
         transaction.execute(
             r#"UPDATE platform_mapping
                SET enabled = 0, validation_status = 'disabled', updated_at_ms = ?1
-               WHERE server_origin = ?2"#,
+               WHERE server_origin = ?2 AND superseded = 0"#,
             params![updated_at_ms, server_origin],
         )?;
         for draft in drafts {
@@ -724,7 +780,7 @@ impl Database {
                        archive_policy, filename_strategy, enabled, validation_status,
                        custom_fields_json, source, updated_at_ms, server_origin
                    ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
-                   ON CONFLICT(id) DO UPDATE SET
+                   ON CONFLICT(server_origin, romm_platform_id) WHERE superseded = 0 DO UPDATE SET
                        romm_platform_id = excluded.romm_platform_id,
                        platform_name = excluded.platform_name,
                        platform_slug = excluded.platform_slug,
@@ -773,6 +829,16 @@ impl Database {
                ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json, updated_at_ms = excluded.updated_at_ms"#,
             params![server_origin, now_ms()],
         )?;
+        transaction.execute(
+            r#"INSERT INTO app_state(key, value_json, updated_at_ms) VALUES('mapping_drafts', ?1, ?2)
+               ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json, updated_at_ms = excluded.updated_at_ms"#,
+            params![draft_json, now_ms()],
+        )?;
+        transaction.execute(
+            r#"INSERT INTO app_state(key, value_json, updated_at_ms) VALUES('mapping_draft_origin', ?1, ?2)
+               ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json, updated_at_ms = excluded.updated_at_ms"#,
+            params![server_origin, now_ms()],
+        )?;
         transaction.commit()?;
         Ok(())
     }
@@ -782,7 +848,7 @@ impl Database {
             return Ok(false);
         }
         let count: i64 = self.connection.query_row(
-            "SELECT COUNT(*) FROM platform_mapping WHERE server_origin = ?1 AND enabled = 1",
+            "SELECT COUNT(*) FROM platform_mapping WHERE server_origin = ?1 AND enabled = 1 AND superseded = 0",
             [server_origin],
             |row| row.get(0),
         )?;
@@ -791,6 +857,44 @@ impl Database {
             .as_deref()
             .is_some_and(|value| value == "true");
         Ok(count > 0 || no_platforms)
+    }
+
+    pub fn update_mapping_validation_statuses(
+        &self,
+        server_origin: &str,
+        result: &romm_ipc::MappingValidationResult,
+    ) -> Result<(), StorageError> {
+        use romm_ipc::MappingPathStatus;
+
+        let mut statuses = std::collections::BTreeMap::<&str, &str>::new();
+        for path in &result.paths {
+            let candidate = match path.status {
+                MappingPathStatus::Ready => "valid",
+                MappingPathStatus::TemporarilyUnavailable => "temporarily_unavailable",
+                MappingPathStatus::PermissionDenied | MappingPathStatus::Unsafe => "invalid",
+            };
+            statuses
+                .entry(&path.draft_id)
+                .and_modify(|current| {
+                    if *current == "valid"
+                        || (*current == "temporarily_unavailable" && candidate == "invalid")
+                    {
+                        *current = candidate;
+                    }
+                })
+                .or_insert(candidate);
+        }
+        let transaction = self.connection.unchecked_transaction()?;
+        for (draft_id, status) in statuses {
+            transaction.execute(
+                r#"UPDATE platform_mapping
+                   SET validation_status = ?1, updated_at_ms = ?2
+                   WHERE server_origin = ?3 AND id = ?4 AND enabled = 1 AND superseded = 0"#,
+                params![status, now_ms(), server_origin, draft_id],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(())
     }
 
     pub fn save_library_page(
@@ -808,7 +912,17 @@ impl Database {
         page: &RomPage,
     ) -> Result<(), StorageError> {
         let transaction = self.connection.unchecked_transaction()?;
-        save_library_page_rows(&transaction, server_origin, &query.cache_key(), page)?;
+        let view_key = query.cache_key();
+        if page.offset == 0 {
+            transaction.execute(
+                "DELETE FROM library_page WHERE server_origin = ?1 AND view_key = ?2",
+                params![server_origin, view_key],
+            )?;
+        }
+        save_library_page_rows(&transaction, server_origin, &view_key, page)?;
+        if !page.has_more && is_complete_library_query(query) {
+            reconcile_complete_library(&transaction, server_origin, &view_key, page.total)?;
+        }
         transaction.commit()?;
         Ok(())
     }
@@ -857,16 +971,16 @@ impl Database {
             })?;
         let mut items = Vec::with_capacity(rom_ids.len());
         for rom_id in rom_ids {
-            let payload: Option<String> = self
+            let payload: Option<(String, bool)> = self
                 .connection
                 .query_row(
-                    r#"SELECT payload_json FROM library_rom
+                    r#"SELECT payload_json, remote_available FROM library_rom
                        WHERE server_origin = ?1 AND romm_id = ?2"#,
                     params![server_origin, rom_id],
-                    |row| row.get(0),
+                    |row| Ok((row.get(0)?, row.get(1)?)),
                 )
                 .optional()?;
-            let Some(payload) = payload else {
+            let Some((payload, remote_available)) = payload else {
                 return Ok(None);
             };
             let mut rom =
@@ -875,6 +989,12 @@ impl Database {
                     message: error.to_string(),
                 })?;
             apply_local_game_state(&self.connection, &mut rom)?;
+            apply_remote_availability(remote_available, &mut rom);
+            if rom.local_status == LocalGameStatus::UnavailableOnServer
+                && query.kind != LibraryViewKind::Downloaded
+            {
+                continue;
+            }
             items.push(rom);
         }
         Ok(Some(RomPage {
@@ -907,26 +1027,32 @@ impl Database {
         limit: u16,
     ) -> Result<RomPage, StorageError> {
         let mut statement = self.connection.prepare(
-            "SELECT payload_json, refreshed_at_ms FROM library_rom WHERE server_origin = ?1",
+            r#"SELECT payload_json, refreshed_at_ms, remote_available
+               FROM library_rom WHERE server_origin = ?1"#,
         )?;
         let rows = statement
             .query_map([server_origin], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, bool>(2)?,
+                ))
             })?
             .collect::<Result<Vec<_>, _>>()?;
         let refreshed_at_ms = rows
             .iter()
-            .map(|(_, refreshed)| *refreshed)
+            .map(|(_, refreshed, _)| *refreshed)
             .max()
             .unwrap_or_else(now_ms);
         let mut items = Vec::new();
-        for (payload, _) in &rows {
+        for (payload, _, remote_available) in &rows {
             let mut rom =
                 serde_json::from_str(payload).map_err(|error| StorageError::InvalidAppState {
                     key: "library_rom.local_view".to_owned(),
                     message: error.to_string(),
                 })?;
             apply_local_game_state(&self.connection, &mut rom)?;
+            apply_remote_availability(*remote_available, &mut rom);
             if library_query_matches(query, &rom) {
                 items.push(rom);
             }
@@ -991,9 +1117,447 @@ impl Database {
                 message: error.to_string(),
             })?;
         apply_local_game_state(&self.connection, &mut details.rom)?;
+        let remote_available = self
+            .connection
+            .query_row(
+                "SELECT remote_available FROM library_rom WHERE server_origin = ?1 AND romm_id = ?2",
+                params![server_origin, rom_id],
+                |row| row.get::<_, bool>(0),
+            )
+            .optional()?
+            .unwrap_or(true);
+        apply_remote_availability(remote_available, &mut details.rom);
         details.source = LibrarySource::Cache;
         details.stale = now_ms().saturating_sub(details.refreshed_at_ms) > LIBRARY_STALE_AFTER_MS;
         Ok(Some(details))
+    }
+
+    pub fn load_library_rom(
+        &self,
+        server_origin: &str,
+        rom_id: i64,
+    ) -> Result<Option<RomSummary>, StorageError> {
+        let cached = self
+            .connection
+            .query_row(
+                r#"SELECT payload_json, remote_available FROM library_rom
+                   WHERE server_origin = ?1 AND romm_id = ?2"#,
+                params![server_origin, rom_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, bool>(1)?)),
+            )
+            .optional()?;
+        let Some((payload, remote_available)) = cached else {
+            return Ok(None);
+        };
+        let mut rom: RomSummary =
+            serde_json::from_str(&payload).map_err(|error| StorageError::InvalidAppState {
+                key: format!("library_rom.{rom_id}"),
+                message: error.to_string(),
+            })?;
+        apply_local_game_state(&self.connection, &mut rom)?;
+        apply_remote_availability(remote_available, &mut rom);
+        Ok(Some(rom))
+    }
+
+    pub fn apply_cached_favorite_states(
+        &self,
+        server_origin: &str,
+        page: &mut RomPage,
+    ) -> Result<(), StorageError> {
+        let mut statement = self.connection.prepare(
+            "SELECT favorite, favorite_pending FROM library_user_rom WHERE server_origin = ?1 AND romm_id = ?2",
+        )?;
+        for rom in &mut page.items {
+            if let Some((favorite, favorite_pending)) = statement
+                .query_row(params![server_origin, rom.id], |row| {
+                    Ok((row.get::<_, bool>(0)?, row.get::<_, bool>(1)?))
+                })
+                .optional()?
+            {
+                rom.user.favorite = favorite;
+                rom.user.favorite_pending = favorite_pending;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn save_authoritative_favorite(
+        &self,
+        server_origin: &str,
+        result: &FavoriteMutationResult,
+        favorite_rom_ids: &[i64],
+    ) -> Result<(), StorageError> {
+        let transaction = self.connection.unchecked_transaction()?;
+        update_cached_rom_favorite(
+            &transaction,
+            server_origin,
+            result.rom_id,
+            result.favorite,
+            now_ms(),
+            true,
+        )?;
+        set_cached_rom_favorite_pending(&transaction, server_origin, result.rom_id, false)?;
+        transaction.execute(
+            r#"DELETE FROM sync_journal
+               WHERE server_origin = ?1 AND operation = 'favorite' AND romm_id = ?2"#,
+            params![server_origin, result.rom_id],
+        )?;
+        if let Some(collection_id) = result.collection_id {
+            update_cached_favorite_collection(
+                &transaction,
+                server_origin,
+                collection_id,
+                favorite_rom_ids,
+                result.collection_updated_at.as_deref(),
+            )?;
+        } else {
+            transaction.execute(
+                "DELETE FROM library_collection WHERE server_origin = ?1 AND is_favorite = 1",
+                [server_origin],
+            )?;
+        }
+        transaction.execute(
+            r#"DELETE FROM library_page
+               WHERE server_origin = ?1
+                 AND (view_key LIKE 'favorites|%' OR view_key LIKE '%|f=true|%')"#,
+            [server_origin],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn queue_favorite_mutation(
+        &self,
+        server_origin: &str,
+        rom_id: i64,
+        desired: bool,
+    ) -> Result<PendingFavoriteMutation, StorageError> {
+        let transaction = self.connection.unchecked_transaction()?;
+        let existing = transaction
+            .query_row(
+                r#"SELECT id, payload_json FROM sync_journal
+                   WHERE server_origin = ?1 AND operation = 'favorite'
+                     AND state = 'pending' AND romm_id = ?2"#,
+                params![server_origin, rom_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?;
+        let prior = existing
+            .as_ref()
+            .map(|(_, payload)| {
+                serde_json::from_str::<PendingFavoriteMutation>(payload).map_err(|error| {
+                    StorageError::InvalidAppState {
+                        key: format!("sync_journal.favorite.{rom_id}"),
+                        message: error.to_string(),
+                    }
+                })
+            })
+            .transpose()?;
+        let cached_user = transaction
+            .query_row(
+                r#"SELECT payload_json FROM library_user_rom
+                   WHERE server_origin = ?1 AND romm_id = ?2"#,
+                params![server_origin, rom_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .map(|payload| {
+                serde_json::from_str::<UserRomState>(&payload).map_err(|error| {
+                    StorageError::InvalidAppState {
+                        key: format!("library_user_rom.{rom_id}"),
+                        message: error.to_string(),
+                    }
+                })
+            })
+            .transpose()?;
+        let timestamp = now_ms();
+        let mutation = PendingFavoriteMutation {
+            rom_id,
+            desired,
+            base_favorite: prior.as_ref().map_or_else(
+                || cached_user.as_ref().is_some_and(|user| user.favorite),
+                |item| item.base_favorite,
+            ),
+            base_updated_at: prior
+                .as_ref()
+                .and_then(|item| item.base_updated_at.clone())
+                .or_else(|| {
+                    cached_user
+                        .as_ref()
+                        .and_then(|user| user.updated_at.clone())
+                }),
+            queued_at_ms: prior.as_ref().map_or(timestamp, |item| item.queued_at_ms),
+            updated_at_ms: timestamp,
+        };
+        let payload_json =
+            serde_json::to_string(&mutation).map_err(|error| StorageError::InvalidAppState {
+                key: format!("sync_journal.favorite.{rom_id}"),
+                message: error.to_string(),
+            })?;
+        if let Some((id, _)) = existing {
+            transaction.execute(
+                r#"UPDATE sync_journal SET payload_json = ?2, updated_at_ms = ?3
+                   WHERE id = ?1"#,
+                params![id, payload_json, timestamp],
+            )?;
+        } else {
+            transaction.execute(
+                r#"INSERT INTO sync_journal(
+                       id, operation, state, payload_json, updated_at_ms,
+                       server_origin, romm_id, created_at_ms
+                   ) VALUES(?1, 'favorite', 'pending', ?2, ?3, ?4, ?5, ?3)"#,
+                params![
+                    format!("favorite:{server_origin}:{rom_id}"),
+                    payload_json,
+                    timestamp,
+                    server_origin,
+                    rom_id,
+                ],
+            )?;
+        }
+        update_cached_rom_favorite(
+            &transaction,
+            server_origin,
+            rom_id,
+            desired,
+            timestamp,
+            true,
+        )?;
+        set_cached_rom_favorite_pending(&transaction, server_origin, rom_id, true)?;
+        transaction.execute(
+            r#"DELETE FROM library_page
+               WHERE server_origin = ?1
+                 AND (view_key LIKE 'favorites|%' OR view_key LIKE '%|f=true|%')"#,
+            [server_origin],
+        )?;
+        transaction.commit()?;
+        Ok(mutation)
+    }
+
+    pub fn pending_favorite_count(&self, server_origin: &str) -> Result<u64, StorageError> {
+        let count = self.connection.query_row(
+            r#"SELECT COUNT(*) FROM sync_journal
+               WHERE server_origin = ?1 AND operation = 'favorite' AND state = 'pending'"#,
+            [server_origin],
+            |row| row.get::<_, u64>(0),
+        )?;
+        Ok(count)
+    }
+
+    pub fn load_pending_favorite_mutations(
+        &self,
+        server_origin: &str,
+    ) -> Result<Vec<PendingFavoriteMutation>, StorageError> {
+        let mut statement = self.connection.prepare(
+            r#"SELECT payload_json FROM sync_journal
+               WHERE server_origin = ?1 AND operation = 'favorite' AND state = 'pending'
+               ORDER BY created_at_ms, romm_id"#,
+        )?;
+        statement
+            .query_map([server_origin], |row| row.get::<_, String>(0))?
+            .map(|payload| {
+                let payload = payload?;
+                serde_json::from_str(&payload).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        0,
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(StorageError::from)
+    }
+
+    pub fn clear_pending_favorite_mutations(
+        &self,
+        server_origin: &str,
+    ) -> Result<(), StorageError> {
+        let pending = self.load_pending_favorite_mutations(server_origin)?;
+        let transaction = self.connection.unchecked_transaction()?;
+        for mutation in pending {
+            update_cached_rom_favorite(
+                &transaction,
+                server_origin,
+                mutation.rom_id,
+                mutation.base_favorite,
+                now_ms(),
+                true,
+            )?;
+            set_cached_rom_favorite_pending(&transaction, server_origin, mutation.rom_id, false)?;
+        }
+        transaction.execute(
+            r#"DELETE FROM sync_journal
+               WHERE server_origin = ?1 AND operation = 'favorite'"#,
+            [server_origin],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn discard_pending_favorite_mutation(
+        &self,
+        server_origin: &str,
+        rom_id: i64,
+        mark_unavailable: bool,
+    ) -> Result<Option<PendingFavoriteMutation>, StorageError> {
+        let transaction = self.connection.unchecked_transaction()?;
+        let payload = transaction
+            .query_row(
+                r#"SELECT payload_json FROM sync_journal
+                   WHERE server_origin = ?1 AND operation = 'favorite'
+                     AND state = 'pending' AND romm_id = ?2"#,
+                params![server_origin, rom_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        let Some(payload) = payload else {
+            return Ok(None);
+        };
+        let mutation =
+            serde_json::from_str::<PendingFavoriteMutation>(&payload).map_err(|error| {
+                StorageError::InvalidAppState {
+                    key: format!("sync_journal.favorite.{rom_id}"),
+                    message: error.to_string(),
+                }
+            })?;
+        update_cached_rom_favorite(
+            &transaction,
+            server_origin,
+            rom_id,
+            mutation.base_favorite,
+            now_ms(),
+            true,
+        )?;
+        set_cached_rom_favorite_pending(&transaction, server_origin, rom_id, false)?;
+        transaction.execute(
+            r#"DELETE FROM sync_journal
+               WHERE server_origin = ?1 AND operation = 'favorite' AND romm_id = ?2"#,
+            params![server_origin, rom_id],
+        )?;
+        if mark_unavailable {
+            transaction.execute(
+                "UPDATE library_rom SET remote_available = 0 WHERE server_origin = ?1 AND romm_id = ?2",
+                params![server_origin, rom_id],
+            )?;
+        }
+        transaction.execute(
+            r#"DELETE FROM library_page
+               WHERE server_origin = ?1
+                 AND (view_key LIKE 'favorites|%' OR view_key LIKE '%|f=true|%')"#,
+            [server_origin],
+        )?;
+        transaction.commit()?;
+        Ok(Some(mutation))
+    }
+
+    pub fn mark_library_rom_unavailable(
+        &self,
+        server_origin: &str,
+        rom_id: i64,
+    ) -> Result<(), StorageError> {
+        self.connection.execute(
+            "UPDATE library_rom SET remote_available = 0 WHERE server_origin = ?1 AND romm_id = ?2",
+            params![server_origin, rom_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn load_cache_entry(&self, key: &str) -> Result<Option<CacheEntryRecord>, StorageError> {
+        self.connection
+            .query_row(
+                r#"SELECT key, local_path, size_bytes, etag, last_accessed_at_ms
+                   FROM cache_entry WHERE key = ?1"#,
+                [key],
+                |row| {
+                    Ok(CacheEntryRecord {
+                        key: row.get(0)?,
+                        local_path: PathBuf::from(row.get::<_, String>(1)?),
+                        size_bytes: row.get(2)?,
+                        etag: row.get(3)?,
+                        last_accessed_at_ms: row.get(4)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(StorageError::from)
+    }
+
+    pub fn save_cache_entry(
+        &self,
+        entry: &CacheEntryRecord,
+        kind: &str,
+    ) -> Result<(), StorageError> {
+        self.connection.execute(
+            r#"INSERT INTO cache_entry(
+                   key, kind, local_path, size_bytes, etag, last_accessed_at_ms, pinned
+               ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, 0)
+               ON CONFLICT(key) DO UPDATE SET
+                   kind = excluded.kind,
+                   local_path = excluded.local_path,
+                   size_bytes = excluded.size_bytes,
+                   etag = excluded.etag,
+                   last_accessed_at_ms = excluded.last_accessed_at_ms"#,
+            params![
+                entry.key,
+                kind,
+                entry.local_path.to_string_lossy(),
+                entry.size_bytes,
+                entry.etag,
+                entry.last_accessed_at_ms,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn touch_cache_entry(&self, key: &str) -> Result<(), StorageError> {
+        self.connection.execute(
+            "UPDATE cache_entry SET last_accessed_at_ms = ?1 WHERE key = ?2",
+            params![now_ms(), key],
+        )?;
+        Ok(())
+    }
+
+    pub fn remove_cache_entry(&self, key: &str) -> Result<Option<CacheEntryRecord>, StorageError> {
+        let entry = self.load_cache_entry(key)?;
+        self.connection
+            .execute("DELETE FROM cache_entry WHERE key = ?1", [key])?;
+        Ok(entry)
+    }
+
+    pub fn prune_cache_entries(
+        &self,
+        kind: &str,
+        budget_bytes: u64,
+    ) -> Result<Vec<CacheEntryRecord>, StorageError> {
+        let mut statement = self.connection.prepare(
+            r#"SELECT key, local_path, size_bytes, etag, last_accessed_at_ms
+               FROM cache_entry WHERE kind = ?1 AND pinned = 0
+               ORDER BY last_accessed_at_ms ASC, key ASC"#,
+        )?;
+        let entries = statement
+            .query_map([kind], |row| {
+                Ok(CacheEntryRecord {
+                    key: row.get(0)?,
+                    local_path: PathBuf::from(row.get::<_, String>(1)?),
+                    size_bytes: row.get(2)?,
+                    etag: row.get(3)?,
+                    last_accessed_at_ms: row.get(4)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut total = entries.iter().map(|entry| entry.size_bytes).sum::<u64>();
+        let mut removed = Vec::new();
+        for entry in entries {
+            if total <= budget_bytes {
+                break;
+            }
+            self.connection
+                .execute("DELETE FROM cache_entry WHERE key = ?1", [&entry.key])?;
+            total = total.saturating_sub(entry.size_bytes);
+            removed.push(entry);
+        }
+        Ok(removed)
     }
 
     pub fn save_library_metadata(
@@ -1034,14 +1598,15 @@ impl Database {
         for collection in &metadata.collections {
             transaction.execute(
                 r#"INSERT INTO library_collection(
-                       server_origin, romm_id, name, kind, rom_count, rom_ids_json,
-                       payload_json, refreshed_at_ms
-                   ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"#,
+                       server_origin, romm_id, name, kind, is_favorite, rom_count,
+                       rom_ids_json, payload_json, refreshed_at_ms
+                   ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)"#,
                 params![
                     server_origin,
                     collection.id,
                     collection.name,
                     collection_kind_as_str(collection.kind),
+                    collection.is_favorite,
                     collection.rom_count,
                     serde_json::to_string(&collection.rom_ids).unwrap_or_else(|_| "[]".to_owned()),
                     serde_json::to_string(collection).map_err(|error| {
@@ -1054,6 +1619,20 @@ impl Database {
                 ],
             )?;
         }
+        let favorite_rom_ids = metadata
+            .collections
+            .iter()
+            .find(|collection| {
+                collection.kind == CollectionKind::Standard && collection.is_favorite
+            })
+            .map(|collection| collection.rom_ids.as_slice())
+            .unwrap_or_default();
+        sync_cached_favorite_membership(
+            &transaction,
+            server_origin,
+            favorite_rom_ids,
+            metadata.refreshed_at_ms,
+        )?;
         transaction.execute(
             r#"INSERT INTO library_snapshot(server_origin, refreshed_at_ms)
                VALUES(?1, ?2)
@@ -1198,6 +1777,12 @@ impl Database {
 }
 
 fn library_query_matches(query: &LibraryQuery, rom: &RomSummary) -> bool {
+    if rom.local_status == LocalGameStatus::UnavailableOnServer
+        && query.kind != LibraryViewKind::Downloaded
+        && !query.downloaded_only
+    {
+        return false;
+    }
     if query.kind == LibraryViewKind::Favorites && !rom.user.favorite {
         return false;
     }
@@ -1274,9 +1859,44 @@ fn save_library_page_rows(
     view_key: &str,
     page: &RomPage,
 ) -> Result<(), StorageError> {
+    let cached_favorite_ids = transaction
+        .query_row(
+            r#"SELECT rom_ids_json FROM library_collection
+               WHERE server_origin = ?1 AND kind = 'standard' AND is_favorite = 1
+               LIMIT 1"#,
+            [server_origin],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .map(|payload| {
+            serde_json::from_str::<Vec<i64>>(&payload)
+                .map(|ids| ids.into_iter().collect::<HashSet<_>>())
+                .map_err(|error| StorageError::InvalidAppState {
+                    key: "library_collection.favorite_rom_ids".to_owned(),
+                    message: error.to_string(),
+                })
+        })
+        .transpose()?;
     for rom in &page.items {
+        let mut rom = rom.clone();
+        let stored_favorite = transaction
+            .query_row(
+                "SELECT favorite, favorite_pending FROM library_user_rom WHERE server_origin = ?1 AND romm_id = ?2",
+                params![server_origin, rom.id],
+                |row| Ok((row.get::<_, bool>(0)?, row.get::<_, bool>(1)?)),
+            )
+            .optional()?;
+        if let Some((favorite, favorite_pending)) = stored_favorite {
+            rom.user.favorite = favorite;
+            rom.user.favorite_pending = favorite_pending;
+        } else if let Some(favorite) = cached_favorite_ids
+            .as_ref()
+            .map(|favorite_ids| favorite_ids.contains(&rom.id))
+        {
+            rom.user.favorite = favorite;
+        }
         let payload_json =
-            serde_json::to_string(rom).map_err(|error| StorageError::InvalidAppState {
+            serde_json::to_string(&rom).map_err(|error| StorageError::InvalidAppState {
                 key: format!("library_rom.{}", rom.id),
                 message: error.to_string(),
             })?;
@@ -1284,8 +1904,8 @@ fn save_library_page_rows(
             r#"INSERT INTO library_rom(
                    server_origin, romm_id, platform_id, platform_name, title, summary,
                    release_date_ms, remote_filename, remote_size_bytes, metadata_updated_at,
-                   payload_json, refreshed_at_ms
-               ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+                   payload_json, refreshed_at_ms, remote_available
+               ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 1)
                ON CONFLICT(server_origin, romm_id) DO UPDATE SET
                    platform_id = excluded.platform_id,
                    platform_name = excluded.platform_name,
@@ -1296,7 +1916,8 @@ fn save_library_page_rows(
                    remote_size_bytes = excluded.remote_size_bytes,
                    metadata_updated_at = excluded.metadata_updated_at,
                    payload_json = excluded.payload_json,
-                   refreshed_at_ms = excluded.refreshed_at_ms"#,
+                   refreshed_at_ms = excluded.refreshed_at_ms,
+                   remote_available = 1"#,
             params![
                 server_origin,
                 rom.id,
@@ -1314,10 +1935,12 @@ fn save_library_page_rows(
         )?;
         transaction.execute(
             r#"INSERT INTO library_user_rom(
-                   server_origin, romm_id, favorite, hidden, rating, payload_json, refreshed_at_ms
-               ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                   server_origin, romm_id, favorite, favorite_pending, hidden, rating,
+                   payload_json, refreshed_at_ms
+               ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
                ON CONFLICT(server_origin, romm_id) DO UPDATE SET
                    favorite = excluded.favorite,
+                   favorite_pending = excluded.favorite_pending,
                    hidden = excluded.hidden,
                    rating = excluded.rating,
                    payload_json = excluded.payload_json,
@@ -1326,6 +1949,7 @@ fn save_library_page_rows(
                 server_origin,
                 rom.id,
                 rom.user.favorite,
+                rom.user.favorite_pending,
                 rom.user.hidden,
                 rom.user.rating,
                 serde_json::to_string(&rom.user).unwrap_or_else(|_| "{}".to_owned()),
@@ -1379,6 +2003,83 @@ fn save_library_page_rows(
     Ok(())
 }
 
+fn is_complete_library_query(query: &LibraryQuery) -> bool {
+    query.kind == LibraryViewKind::All
+        && query.id.is_none()
+        && query.normalized_search().is_none()
+        && query.platform_id.is_none()
+        && query.collection_id.is_none()
+        && !query.favorite_only
+        && !query.downloaded_only
+}
+
+fn reconcile_complete_library(
+    transaction: &Transaction<'_>,
+    server_origin: &str,
+    view_key: &str,
+    expected_total: Option<u64>,
+) -> Result<(), StorageError> {
+    let mut statement = transaction.prepare(
+        r#"SELECT rom_ids_json FROM library_page
+           WHERE server_origin = ?1 AND view_key = ?2
+           ORDER BY page_offset ASC"#,
+    )?;
+    let page_payloads = statement
+        .query_map(params![server_origin, view_key], |row| {
+            row.get::<_, String>(0)
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    drop(statement);
+    let mut rom_ids = Vec::new();
+    for payload in page_payloads {
+        let page_ids: Vec<i64> =
+            serde_json::from_str(&payload).map_err(|error| StorageError::InvalidAppState {
+                key: "library_page.rom_ids".to_owned(),
+                message: error.to_string(),
+            })?;
+        rom_ids.extend(page_ids);
+    }
+    rom_ids.sort_unstable();
+    rom_ids.dedup();
+    if expected_total.is_some_and(|total| total != rom_ids.len() as u64) {
+        return Ok(());
+    }
+
+    transaction.execute(
+        "UPDATE library_rom SET remote_available = 0 WHERE server_origin = ?1",
+        [server_origin],
+    )?;
+    {
+        let mut mark_available = transaction.prepare(
+            "UPDATE library_rom SET remote_available = 1 WHERE server_origin = ?1 AND romm_id = ?2",
+        )?;
+        for rom_id in &rom_ids {
+            mark_available.execute(params![server_origin, rom_id])?;
+        }
+    }
+    for table in ["library_user_rom", "library_artwork", "library_game_detail"] {
+        transaction.execute(
+            &format!(
+                r#"DELETE FROM {table}
+                   WHERE server_origin = ?1
+                     AND romm_id IN (
+                         SELECT romm_id FROM library_rom
+                         WHERE server_origin = ?1 AND remote_available = 0
+                           AND romm_id NOT IN (SELECT romm_id FROM downloaded_rom)
+                     )"#
+            ),
+            [server_origin],
+        )?;
+    }
+    transaction.execute(
+        r#"DELETE FROM library_rom
+           WHERE server_origin = ?1 AND remote_available = 0
+             AND romm_id NOT IN (SELECT romm_id FROM downloaded_rom)"#,
+        [server_origin],
+    )?;
+    Ok(())
+}
+
 fn apply_local_game_state(
     connection: &Connection,
     rom: &mut RomSummary,
@@ -1411,6 +2112,335 @@ fn apply_local_game_state(
             |row| row.get::<_, String>(0),
         )
         .optional()?;
+    Ok(())
+}
+
+fn apply_remote_availability(remote_available: bool, rom: &mut RomSummary) {
+    if !remote_available && rom.local_status != LocalGameStatus::RemoteOnly {
+        rom.local_status = LocalGameStatus::UnavailableOnServer;
+    }
+}
+
+fn sync_cached_favorite_membership(
+    transaction: &Transaction<'_>,
+    server_origin: &str,
+    favorite_rom_ids: &[i64],
+    refreshed_at_ms: i64,
+) -> Result<(), StorageError> {
+    let favorites = favorite_rom_ids.iter().copied().collect::<HashSet<_>>();
+    let mut statement = transaction
+        .prepare("SELECT romm_id FROM library_rom WHERE server_origin = ?1 ORDER BY romm_id")?;
+    let rom_ids = statement
+        .query_map([server_origin], |row| row.get::<_, i64>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    drop(statement);
+    for rom_id in rom_ids {
+        update_cached_rom_favorite(
+            transaction,
+            server_origin,
+            rom_id,
+            favorites.contains(&rom_id),
+            refreshed_at_ms,
+            false,
+        )?;
+    }
+    Ok(())
+}
+
+fn update_cached_rom_favorite(
+    transaction: &Transaction<'_>,
+    server_origin: &str,
+    rom_id: i64,
+    favorite: bool,
+    refreshed_at_ms: i64,
+    overwrite_pending: bool,
+) -> Result<(), StorageError> {
+    let favorite_pending = transaction
+        .query_row(
+            r#"SELECT favorite_pending FROM library_user_rom
+               WHERE server_origin = ?1 AND romm_id = ?2"#,
+            params![server_origin, rom_id],
+            |row| row.get::<_, bool>(0),
+        )
+        .optional()?
+        .unwrap_or(false);
+    if favorite_pending && !overwrite_pending {
+        return Ok(());
+    }
+    let cached_user = transaction
+        .query_row(
+            r#"SELECT payload_json FROM library_user_rom
+               WHERE server_origin = ?1 AND romm_id = ?2"#,
+            params![server_origin, rom_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    let mut user = cached_user
+        .as_deref()
+        .map(serde_json::from_str::<UserRomState>)
+        .transpose()
+        .map_err(|error| StorageError::InvalidAppState {
+            key: format!("library_user_rom.{rom_id}"),
+            message: error.to_string(),
+        })?
+        .unwrap_or_else(|| UserRomState {
+            rom_id,
+            ..UserRomState::default()
+        });
+    user.favorite = favorite;
+    let user_payload =
+        serde_json::to_string(&user).map_err(|error| StorageError::InvalidAppState {
+            key: format!("library_user_rom.{rom_id}"),
+            message: error.to_string(),
+        })?;
+    transaction.execute(
+        r#"INSERT INTO library_user_rom(
+               server_origin, romm_id, favorite, favorite_pending, hidden, rating,
+               payload_json, refreshed_at_ms
+           ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+           ON CONFLICT(server_origin, romm_id) DO UPDATE SET
+               favorite = excluded.favorite,
+               favorite_pending = excluded.favorite_pending,
+               payload_json = excluded.payload_json,
+               refreshed_at_ms = excluded.refreshed_at_ms"#,
+        params![
+            server_origin,
+            rom_id,
+            favorite,
+            user.favorite_pending,
+            user.hidden,
+            user.rating,
+            user_payload,
+            refreshed_at_ms,
+        ],
+    )?;
+
+    if let Some(payload) = transaction
+        .query_row(
+            r#"SELECT payload_json FROM library_rom
+               WHERE server_origin = ?1 AND romm_id = ?2"#,
+            params![server_origin, rom_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+    {
+        let mut rom: RomSummary =
+            serde_json::from_str(&payload).map_err(|error| StorageError::InvalidAppState {
+                key: format!("library_rom.{rom_id}"),
+                message: error.to_string(),
+            })?;
+        rom.user.favorite = favorite;
+        transaction.execute(
+            r#"UPDATE library_rom SET payload_json = ?3
+               WHERE server_origin = ?1 AND romm_id = ?2"#,
+            params![
+                server_origin,
+                rom_id,
+                serde_json::to_string(&rom).map_err(|error| {
+                    StorageError::InvalidAppState {
+                        key: format!("library_rom.{rom_id}"),
+                        message: error.to_string(),
+                    }
+                })?,
+            ],
+        )?;
+    }
+    if let Some(payload) = transaction
+        .query_row(
+            r#"SELECT payload_json FROM library_game_detail
+               WHERE server_origin = ?1 AND romm_id = ?2"#,
+            params![server_origin, rom_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+    {
+        let mut details: GameDetails =
+            serde_json::from_str(&payload).map_err(|error| StorageError::InvalidAppState {
+                key: format!("library_game_detail.{rom_id}"),
+                message: error.to_string(),
+            })?;
+        details.rom.user.favorite = favorite;
+        transaction.execute(
+            r#"UPDATE library_game_detail SET payload_json = ?3
+               WHERE server_origin = ?1 AND romm_id = ?2"#,
+            params![
+                server_origin,
+                rom_id,
+                serde_json::to_string(&details).map_err(|error| {
+                    StorageError::InvalidAppState {
+                        key: format!("library_game_detail.{rom_id}"),
+                        message: error.to_string(),
+                    }
+                })?,
+            ],
+        )?;
+    }
+    Ok(())
+}
+
+fn set_cached_rom_favorite_pending(
+    transaction: &Transaction<'_>,
+    server_origin: &str,
+    rom_id: i64,
+    favorite_pending: bool,
+) -> Result<(), StorageError> {
+    let payload = transaction
+        .query_row(
+            r#"SELECT payload_json FROM library_user_rom
+               WHERE server_origin = ?1 AND romm_id = ?2"#,
+            params![server_origin, rom_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    if let Some(payload) = payload {
+        let mut user: UserRomState =
+            serde_json::from_str(&payload).map_err(|error| StorageError::InvalidAppState {
+                key: format!("library_user_rom.{rom_id}"),
+                message: error.to_string(),
+            })?;
+        user.favorite_pending = favorite_pending;
+        transaction.execute(
+            r#"UPDATE library_user_rom
+               SET favorite_pending = ?3, payload_json = ?4
+               WHERE server_origin = ?1 AND romm_id = ?2"#,
+            params![
+                server_origin,
+                rom_id,
+                favorite_pending,
+                serde_json::to_string(&user).map_err(|error| {
+                    StorageError::InvalidAppState {
+                        key: format!("library_user_rom.{rom_id}"),
+                        message: error.to_string(),
+                    }
+                })?,
+            ],
+        )?;
+    }
+    if let Some(payload) = transaction
+        .query_row(
+            r#"SELECT payload_json FROM library_rom
+               WHERE server_origin = ?1 AND romm_id = ?2"#,
+            params![server_origin, rom_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+    {
+        let mut rom: RomSummary =
+            serde_json::from_str(&payload).map_err(|error| StorageError::InvalidAppState {
+                key: format!("library_rom.{rom_id}"),
+                message: error.to_string(),
+            })?;
+        rom.user.favorite_pending = favorite_pending;
+        transaction.execute(
+            r#"UPDATE library_rom SET payload_json = ?3
+               WHERE server_origin = ?1 AND romm_id = ?2"#,
+            params![
+                server_origin,
+                rom_id,
+                serde_json::to_string(&rom).map_err(|error| {
+                    StorageError::InvalidAppState {
+                        key: format!("library_rom.{rom_id}"),
+                        message: error.to_string(),
+                    }
+                })?,
+            ],
+        )?;
+    }
+    if let Some(payload) = transaction
+        .query_row(
+            r#"SELECT payload_json FROM library_game_detail
+               WHERE server_origin = ?1 AND romm_id = ?2"#,
+            params![server_origin, rom_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+    {
+        let mut details: GameDetails =
+            serde_json::from_str(&payload).map_err(|error| StorageError::InvalidAppState {
+                key: format!("library_game_detail.{rom_id}"),
+                message: error.to_string(),
+            })?;
+        details.rom.user.favorite_pending = favorite_pending;
+        transaction.execute(
+            r#"UPDATE library_game_detail SET payload_json = ?3
+               WHERE server_origin = ?1 AND romm_id = ?2"#,
+            params![
+                server_origin,
+                rom_id,
+                serde_json::to_string(&details).map_err(|error| {
+                    StorageError::InvalidAppState {
+                        key: format!("library_game_detail.{rom_id}"),
+                        message: error.to_string(),
+                    }
+                })?,
+            ],
+        )?;
+    }
+    Ok(())
+}
+
+fn update_cached_favorite_collection(
+    transaction: &Transaction<'_>,
+    server_origin: &str,
+    collection_id: i64,
+    favorite_rom_ids: &[i64],
+    updated_at: Option<&str>,
+) -> Result<(), StorageError> {
+    let payload = transaction
+        .query_row(
+            r#"SELECT payload_json FROM library_collection
+               WHERE server_origin = ?1 AND kind = 'standard' AND romm_id = ?2"#,
+            params![server_origin, collection_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    let mut collection: LibraryCollection = if let Some(payload) = payload {
+        serde_json::from_str(&payload).map_err(|error| StorageError::InvalidAppState {
+            key: format!("library_collection.{collection_id}"),
+            message: error.to_string(),
+        })?
+    } else {
+        LibraryCollection {
+            id: collection_id,
+            name: "Favorites".to_owned(),
+            kind: CollectionKind::Standard,
+            is_favorite: true,
+            rom_ids: Vec::new(),
+            rom_count: Some(0),
+            updated_at: None,
+        }
+    };
+    collection.is_favorite = true;
+    collection.rom_ids = favorite_rom_ids.to_vec();
+    collection.rom_count = Some(favorite_rom_ids.len() as u64);
+    collection.updated_at = updated_at.map(ToOwned::to_owned);
+    transaction.execute(
+        r#"INSERT INTO library_collection(
+               server_origin, romm_id, name, kind, is_favorite, rom_count,
+               rom_ids_json, payload_json, refreshed_at_ms
+           ) VALUES(?1, ?2, ?3, 'standard', 1, ?4, ?5, ?6, ?7)
+           ON CONFLICT(server_origin, kind, romm_id) DO UPDATE SET
+               name = excluded.name,
+               is_favorite = 1,
+               rom_count = excluded.rom_count,
+               rom_ids_json = excluded.rom_ids_json,
+               payload_json = excluded.payload_json,
+               refreshed_at_ms = excluded.refreshed_at_ms"#,
+        params![
+            server_origin,
+            collection_id,
+            &collection.name,
+            favorite_rom_ids.len() as u64,
+            serde_json::to_string(favorite_rom_ids).unwrap_or_else(|_| "[]".to_owned()),
+            serde_json::to_string(&collection).map_err(|error| {
+                StorageError::InvalidAppState {
+                    key: format!("library_collection.{collection_id}"),
+                    message: error.to_string(),
+                }
+            })?,
+            now_ms(),
+        ],
+    )?;
     Ok(())
 }
 
@@ -1689,7 +2719,63 @@ fn run_migrations(connection: &mut Connection) -> Result<(), StorageError> {
             [now_ms()],
         )?;
     }
-    transaction.pragma_update(None, "user_version", 10)?;
+    if version < 11 {
+        transaction.execute_batch(
+            "ALTER TABLE library_rom ADD COLUMN remote_available INTEGER NOT NULL DEFAULT 1;",
+        )?;
+        transaction.execute(
+            "INSERT OR IGNORE INTO schema_migrations(version, applied_at_ms) VALUES(11, ?1)",
+            [now_ms()],
+        )?;
+    }
+    if version < 12 {
+        transaction.execute_batch(
+            "ALTER TABLE library_collection ADD COLUMN is_favorite INTEGER NOT NULL DEFAULT 0;",
+        )?;
+        transaction.execute(
+            "INSERT OR IGNORE INTO schema_migrations(version, applied_at_ms) VALUES(12, ?1)",
+            [now_ms()],
+        )?;
+    }
+    if version < 13 {
+        transaction.execute_batch(
+            r#"ALTER TABLE library_user_rom ADD COLUMN favorite_pending INTEGER NOT NULL DEFAULT 0;
+               ALTER TABLE sync_journal ADD COLUMN server_origin TEXT;
+               ALTER TABLE sync_journal ADD COLUMN romm_id INTEGER;
+               ALTER TABLE sync_journal ADD COLUMN created_at_ms INTEGER NOT NULL DEFAULT 0;
+               CREATE UNIQUE INDEX idx_sync_journal_pending_favorite
+               ON sync_journal(server_origin, operation, romm_id)
+               WHERE operation = 'favorite' AND state = 'pending';"#,
+        )?;
+        transaction.execute(
+            "INSERT OR IGNORE INTO schema_migrations(version, applied_at_ms) VALUES(13, ?1)",
+            [now_ms()],
+        )?;
+    }
+    if version < 14 {
+        transaction.execute_batch(
+            r#"ALTER TABLE platform_mapping ADD COLUMN superseded INTEGER NOT NULL DEFAULT 0;
+               UPDATE platform_mapping AS older
+               SET superseded = 1, enabled = 0, validation_status = 'superseded'
+               WHERE EXISTS (
+                   SELECT 1 FROM platform_mapping AS newer
+                   WHERE newer.server_origin = older.server_origin
+                     AND newer.romm_platform_id = older.romm_platform_id
+                     AND (
+                         newer.updated_at_ms > older.updated_at_ms
+                         OR (newer.updated_at_ms = older.updated_at_ms AND newer.rowid > older.rowid)
+                     )
+               );
+               CREATE UNIQUE INDEX idx_platform_mapping_origin_platform
+               ON platform_mapping(server_origin, romm_platform_id)
+               WHERE superseded = 0;"#,
+        )?;
+        transaction.execute(
+            "INSERT OR IGNORE INTO schema_migrations(version, applied_at_ms) VALUES(14, ?1)",
+            [now_ms()],
+        )?;
+    }
+    transaction.pragma_update(None, "user_version", 14)?;
     transaction.commit()?;
     Ok(())
 }
@@ -1702,6 +2788,15 @@ fn archive_policy_as_str(policy: ArchivePolicy) -> &'static str {
     }
 }
 
+fn archive_policy_from_str(value: &str) -> Result<ArchivePolicy, rusqlite::Error> {
+    match value {
+        "keep" => Ok(ArchivePolicy::Keep),
+        "extract_keep" => Ok(ArchivePolicy::ExtractKeep),
+        "extract_delete" => Ok(ArchivePolicy::ExtractDelete),
+        _ => Err(invalid_mapping_field("archive_policy", value)),
+    }
+}
+
 fn mapping_source_as_str(source: MappingSource) -> &'static str {
     match source {
         MappingSource::Unconfigured => "unconfigured",
@@ -1709,6 +2804,45 @@ fn mapping_source_as_str(source: MappingSource) -> &'static str {
         MappingSource::EmuDeckRemovable => "emudeck_removable",
         MappingSource::Custom => "custom",
     }
+}
+
+fn mapping_source_from_str(value: &str) -> Result<MappingSource, rusqlite::Error> {
+    match value {
+        "unconfigured" => Ok(MappingSource::Unconfigured),
+        "emudeck_internal" => Ok(MappingSource::EmuDeckInternal),
+        "emudeck_removable" => Ok(MappingSource::EmuDeckRemovable),
+        "custom" => Ok(MappingSource::Custom),
+        _ => Err(invalid_mapping_field("source", value)),
+    }
+}
+
+fn json_mapping_column<T: serde::de::DeserializeOwned>(
+    row: &rusqlite::Row<'_>,
+    index: usize,
+    field: &str,
+) -> Result<T, rusqlite::Error> {
+    let value = row.get::<_, String>(index)?;
+    serde_json::from_str(&value).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(
+            index,
+            rusqlite::types::Type::Text,
+            Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("invalid mapping {field}: {error}"),
+            )),
+        )
+    })
+}
+
+fn invalid_mapping_field(field: &str, value: &str) -> rusqlite::Error {
+    rusqlite::Error::FromSqlConversionFailure(
+        0,
+        rusqlite::types::Type::Text,
+        Box::new(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("invalid mapping {field}: {value}"),
+        )),
+    )
 }
 
 fn device_platform_as_str(platform: DevicePlatform) -> &'static str {
@@ -2137,6 +3271,182 @@ mod tests {
     }
 
     #[test]
+    fn platform_mappings_round_trip_custom_ownership_and_are_origin_scoped() {
+        let temporary = tempfile::tempdir().expect("temporary directory should be created");
+        let paths = AppPaths::from_roots(
+            temporary.path().join("config"),
+            temporary.path().join("data"),
+            temporary.path().join("cache"),
+        );
+        let database = Database::open(&paths).expect("database should open");
+        let first_origin = "https://first.example.test";
+        let second_origin = "https://second.example.test";
+        let mut first = mapping_draft("6de33602-855d-4cf1-8650-30cdde789f64", 1);
+        first.preset_id = Some("emudeck".to_owned());
+        first.preset_version = Some(2);
+        first.archive_policy = ArchivePolicy::ExtractKeep;
+        first.custom_fields = std::collections::BTreeMap::from([
+            ("romRoot".to_owned(), true),
+            ("archivePolicy".to_owned(), true),
+        ]);
+        let second = PlatformMappingDraft {
+            id: "f04b9d2b-1853-4261-9768-2df197d44d99".to_owned(),
+            rom_root: "D:/Second/roms/gba".to_owned(),
+            ..first.clone()
+        };
+
+        database
+            .save_platform_mappings(first_origin, std::slice::from_ref(&first), false)
+            .expect("first mapping should save");
+        database
+            .save_platform_mappings(second_origin, std::slice::from_ref(&second), false)
+            .expect("second mapping should save");
+
+        assert_eq!(
+            database
+                .load_platform_mappings(first_origin)
+                .expect("first mapping should load"),
+            vec![first]
+        );
+        assert_eq!(
+            database
+                .load_platform_mappings(second_origin)
+                .expect("second mapping should load"),
+            vec![second]
+        );
+    }
+
+    #[test]
+    fn same_origin_platform_upsert_preserves_the_local_identity_without_duplicates() {
+        let temporary = tempfile::tempdir().expect("temporary directory should be created");
+        let paths = AppPaths::from_roots(
+            temporary.path().join("config"),
+            temporary.path().join("data"),
+            temporary.path().join("cache"),
+        );
+        let database = Database::open(&paths).expect("database should open");
+        let origin = "https://romm.example.test";
+        database
+            .save_platform_mappings(origin, &[mapping_draft("legacy-platform-1", 1)], false)
+            .expect("legacy mapping should save");
+        let replacement = mapping_draft("6de33602-855d-4cf1-8650-30cdde789f64", 1);
+        database
+            .save_platform_mappings(origin, std::slice::from_ref(&replacement), false)
+            .expect("mapping update should preserve the stored identity");
+
+        let stored = database
+            .load_platform_mappings(origin)
+            .expect("mapping should load");
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].id, "legacy-platform-1");
+        assert_eq!(stored[0].rom_root, replacement.rom_root);
+        let count: i64 = database
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM platform_mapping WHERE server_origin = ?1 AND romm_platform_id = 1",
+                [origin],
+                |row| row.get(0),
+            )
+            .expect("mapping count should load");
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn corrupt_normalized_mapping_fields_fail_loading_instead_of_losing_overrides() {
+        let temporary = tempfile::tempdir().expect("temporary directory should be created");
+        let paths = AppPaths::from_roots(
+            temporary.path().join("config"),
+            temporary.path().join("data"),
+            temporary.path().join("cache"),
+        );
+        let database = Database::open(&paths).expect("database should open");
+        let origin = "https://romm.example.test";
+        database
+            .save_platform_mappings(origin, &[mapping_draft("mapping-id", 1)], false)
+            .expect("mapping should save");
+        database
+            .connection
+            .execute(
+                "UPDATE platform_mapping SET save_roots_json = 'not-json' WHERE id = 'mapping-id'",
+                [],
+            )
+            .expect("corrupt fixture should save");
+
+        let error = database
+            .load_platform_mappings(origin)
+            .expect_err("corrupt mapping must not be treated as an empty configuration");
+        assert!(
+            error
+                .to_string()
+                .contains("invalid mapping save_roots_json")
+        );
+    }
+
+    #[test]
+    fn mapping_health_transitions_from_unavailable_back_to_valid() {
+        let temporary = tempfile::tempdir().expect("temporary directory should be created");
+        let paths = AppPaths::from_roots(
+            temporary.path().join("config"),
+            temporary.path().join("data"),
+            temporary.path().join("cache"),
+        );
+        let database = Database::open(&paths).expect("database should open");
+        let origin = "https://romm.example.test";
+        database
+            .save_platform_mappings(origin, &[mapping_draft("platform-1", 1)], false)
+            .expect("mapping should save");
+
+        let result_for = |status| romm_ipc::MappingValidationResult {
+            valid: status == romm_ipc::MappingPathStatus::Ready,
+            issues: Vec::new(),
+            paths: vec![romm_ipc::MappingPathValidation {
+                draft_id: "platform-1".to_owned(),
+                field: "romRoot".to_owned(),
+                path: "R:/roms/gba".to_owned(),
+                canonical_path: None,
+                status,
+                readable: status == romm_ipc::MappingPathStatus::Ready,
+                writable: status == romm_ipc::MappingPathStatus::Ready,
+                available_bytes: None,
+                removable: true,
+                mounted: status == romm_ipc::MappingPathStatus::Ready,
+                contains_symlink: false,
+            }],
+        };
+        database
+            .update_mapping_validation_statuses(
+                origin,
+                &result_for(romm_ipc::MappingPathStatus::TemporarilyUnavailable),
+            )
+            .expect("missing mount status should save");
+        let unavailable: String = database
+            .connection
+            .query_row(
+                "SELECT validation_status FROM platform_mapping WHERE id = 'platform-1'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("status should load");
+        assert_eq!(unavailable, "temporarily_unavailable");
+
+        database
+            .update_mapping_validation_statuses(
+                origin,
+                &result_for(romm_ipc::MappingPathStatus::Ready),
+            )
+            .expect("recovered mount status should save");
+        let recovered: String = database
+            .connection
+            .query_row(
+                "SELECT validation_status FROM platform_mapping WHERE id = 'platform-1'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("status should load");
+        assert_eq!(recovered, "valid");
+    }
+
+    #[test]
     fn an_explicit_no_platform_outcome_is_scoped_to_its_server() {
         let temporary = tempfile::tempdir().expect("temporary directory should be created");
         let paths = AppPaths::from_roots(
@@ -2298,6 +3608,123 @@ mod tests {
             )
             .expect("normalized rows should load");
         assert_eq!(normalized_counts, (2, 2));
+    }
+
+    #[test]
+    fn complete_refresh_removes_remote_only_rows_and_preserves_unavailable_local_copies() {
+        let temporary = tempfile::tempdir().expect("temporary directory should be created");
+        let paths = AppPaths::from_roots(
+            temporary.path().join("config"),
+            temporary.path().join("data"),
+            temporary.path().join("cache"),
+        );
+        let database = Database::open(&paths).expect("database should open");
+        let origin = "https://romm.example.test";
+        let first_page = RomPage {
+            items: vec![
+                library_rom(42, "Remote only"),
+                library_rom(43, "Downloaded"),
+            ],
+            offset: 0,
+            limit: 48,
+            total: Some(2),
+            has_more: false,
+            source: LibrarySource::Live,
+            refreshed_at_ms: now_ms(),
+            stale: false,
+        };
+        database
+            .save_library_view_page(origin, &LibraryQuery::all(), &first_page)
+            .expect("initial complete page should save");
+        let local_path = temporary.path().join("Downloaded.sfc");
+        fs::write(&local_path, b"rom").expect("local copy should write");
+        database
+            .connection
+            .execute(
+                "INSERT INTO downloaded_rom(romm_id, local_path, updated_at_ms) VALUES(43, ?1, ?2)",
+                params![local_path.to_string_lossy(), now_ms()],
+            )
+            .expect("downloaded state should save");
+
+        database
+            .save_library_view_page(
+                origin,
+                &LibraryQuery::all(),
+                &library_page(44, "New catalog", now_ms()),
+            )
+            .expect("replacement complete page should save");
+
+        assert!(
+            database
+                .load_library_rom(origin, 42)
+                .expect("removed ROM lookup should succeed")
+                .is_none(),
+            "a removed remote-only ROM must not remain in the cache"
+        );
+        let preserved = database
+            .load_library_rom(origin, 43)
+            .expect("local ROM lookup should succeed")
+            .expect("local ROM should be preserved");
+        assert_eq!(preserved.local_status, LocalGameStatus::UnavailableOnServer);
+        let downloaded = database
+            .load_local_library_page(
+                origin,
+                &LibraryQuery {
+                    kind: LibraryViewKind::Downloaded,
+                    id: None,
+                    ..LibraryQuery::all()
+                },
+                0,
+                48,
+            )
+            .expect("downloaded view should load");
+        assert_eq!(downloaded.items.len(), 1);
+        assert_eq!(
+            downloaded.items[0].local_status,
+            LocalGameStatus::UnavailableOnServer
+        );
+    }
+
+    #[test]
+    fn artwork_cache_pruning_removes_oldest_unpinned_entries_first() {
+        let temporary = tempfile::tempdir().expect("temporary directory should be created");
+        let paths = AppPaths::from_roots(
+            temporary.path().join("config"),
+            temporary.path().join("data"),
+            temporary.path().join("cache"),
+        );
+        let database = Database::open(&paths).expect("database should open");
+        for (key, accessed) in [("older", 1), ("newer", 2)] {
+            database
+                .save_cache_entry(
+                    &CacheEntryRecord {
+                        key: key.to_owned(),
+                        local_path: paths.artwork_cache_dir().join(format!("{key}.png")),
+                        size_bytes: 7,
+                        etag: None,
+                        last_accessed_at_ms: accessed,
+                    },
+                    "artwork",
+                )
+                .expect("cache entry should save");
+        }
+
+        let removed = database
+            .prune_cache_entries("artwork", 7)
+            .expect("cache pruning should succeed");
+        assert_eq!(
+            removed
+                .iter()
+                .map(|entry| entry.key.as_str())
+                .collect::<Vec<_>>(),
+            vec!["older"]
+        );
+        assert!(
+            database
+                .load_cache_entry("newer")
+                .expect("remaining entry should load")
+                .is_some()
+        );
     }
 
     #[test]
@@ -2554,6 +3981,7 @@ mod tests {
                 id: 3,
                 name: "Favorites".to_owned(),
                 kind: CollectionKind::Standard,
+                is_favorite: true,
                 rom_ids: vec![42],
                 rom_count: Some(1),
                 updated_at: Some("2026-08-31T12:00:00Z".to_owned()),
@@ -2579,6 +4007,226 @@ mod tests {
                 .expect("other origin lookup should succeed")
                 .is_none()
         );
+    }
+
+    #[test]
+    fn favorite_metadata_and_mutations_update_normalized_cached_state() {
+        let temporary = tempfile::tempdir().expect("temporary directory should be created");
+        let paths = AppPaths::from_roots(
+            temporary.path().join("config"),
+            temporary.path().join("data"),
+            temporary.path().join("cache"),
+        );
+        let database = Database::open(&paths).expect("database should open");
+        let origin = "https://romm.example.test";
+        let page = library_page(42, "Chrono Trigger", now_ms());
+        database
+            .save_library_page(origin, &page)
+            .expect("library page should save");
+        let favorites_query = LibraryQuery {
+            kind: LibraryViewKind::Favorites,
+            ..LibraryQuery::all()
+        };
+        database
+            .save_library_view_page(origin, &favorites_query, &page)
+            .expect("favorites page should save");
+
+        let metadata = LibraryMetadata {
+            platforms: Vec::new(),
+            collections: vec![LibraryCollection {
+                id: 3,
+                name: "Favorites".to_owned(),
+                kind: CollectionKind::Standard,
+                is_favorite: true,
+                rom_ids: vec![42],
+                rom_count: Some(1),
+                updated_at: None,
+            }],
+            source: LibrarySource::Live,
+            refreshed_at_ms: now_ms(),
+            stale: false,
+        };
+        database
+            .save_library_metadata(origin, &metadata)
+            .expect("favorite metadata should save");
+        assert!(
+            database
+                .load_library_rom(origin, 42)
+                .expect("cached ROM should load")
+                .expect("cached ROM should exist")
+                .user
+                .favorite
+        );
+
+        database
+            .save_authoritative_favorite(
+                origin,
+                &FavoriteMutationResult {
+                    rom_id: 42,
+                    requested: false,
+                    favorite: false,
+                    collection_id: Some(3),
+                    collection_updated_at: Some("2026-09-04T12:00:00Z".to_owned()),
+                },
+                &[],
+            )
+            .expect("authoritative favorite should save");
+        assert!(
+            !database
+                .load_library_rom(origin, 42)
+                .expect("cached ROM should load")
+                .expect("cached ROM should exist")
+                .user
+                .favorite
+        );
+        assert!(
+            database
+                .load_library_view_page(origin, &favorites_query, 0, 48)
+                .expect("favorites page lookup should succeed")
+                .is_none(),
+            "favorite-dependent exact pages must be invalidated after a mutation"
+        );
+        let cached_metadata = database
+            .load_library_metadata(origin)
+            .expect("metadata should load")
+            .expect("metadata should exist");
+        assert!(cached_metadata.collections[0].rom_ids.is_empty());
+        assert_eq!(cached_metadata.collections[0].rom_count, Some(0));
+    }
+
+    #[test]
+    fn pending_favorites_coalesce_survive_restart_and_resist_cache_refresh() {
+        let temporary = tempfile::tempdir().expect("temporary directory should be created");
+        let paths = AppPaths::from_roots(
+            temporary.path().join("config"),
+            temporary.path().join("data"),
+            temporary.path().join("cache"),
+        );
+        let origin = "https://romm.example.test";
+        let first_queued_at;
+        {
+            let database = Database::open(&paths).expect("database should open");
+            let mut page = library_page(42, "Chrono Trigger", now_ms());
+            page.items[0].user.updated_at = Some("2026-09-04T12:00:00Z".to_owned());
+            database
+                .save_library_page(origin, &page)
+                .expect("library page should save");
+
+            let first = database
+                .queue_favorite_mutation(origin, 42, false)
+                .expect("offline favorite should queue");
+            first_queued_at = first.queued_at_ms;
+            assert!(first.base_favorite);
+            assert_eq!(
+                first.base_updated_at.as_deref(),
+                Some("2026-09-04T12:00:00Z")
+            );
+            database
+                .queue_favorite_mutation(origin, 42, true)
+                .expect("second toggle should coalesce");
+            let final_mutation = database
+                .queue_favorite_mutation(origin, 42, false)
+                .expect("final toggle should coalesce");
+            assert_eq!(final_mutation.queued_at_ms, first_queued_at);
+            assert_eq!(database.pending_favorite_count(origin).unwrap(), 1);
+            database
+                .queue_favorite_mutation("https://other.example.test", 42, true)
+                .expect("another origin should have an independent queue");
+            assert_eq!(
+                database
+                    .pending_favorite_count("https://other.example.test")
+                    .unwrap(),
+                1
+            );
+
+            let server_refresh = library_page(42, "Chrono Trigger", now_ms());
+            database
+                .save_library_page(origin, &server_refresh)
+                .expect("refresh should save without replacing pending intent");
+            let cached = database
+                .load_library_rom(origin, 42)
+                .expect("cached ROM should load")
+                .expect("cached ROM should exist");
+            assert!(!cached.user.favorite);
+            assert!(cached.user.favorite_pending);
+        }
+
+        let reopened = Database::open(&paths).expect("database should reopen");
+        let pending = reopened
+            .load_pending_favorite_mutations(origin)
+            .expect("pending favorites should load after restart");
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].rom_id, 42);
+        assert!(!pending[0].desired);
+        assert!(pending[0].base_favorite);
+        assert_eq!(pending[0].queued_at_ms, first_queued_at);
+
+        reopened
+            .save_authoritative_favorite(
+                origin,
+                &FavoriteMutationResult {
+                    rom_id: 42,
+                    requested: false,
+                    favorite: false,
+                    collection_id: Some(3),
+                    collection_updated_at: Some("2026-09-04T12:30:00Z".to_owned()),
+                },
+                &[],
+            )
+            .expect("authoritative save should clear pending state");
+        assert_eq!(reopened.pending_favorite_count(origin).unwrap(), 0);
+        assert_eq!(
+            reopened
+                .pending_favorite_count("https://other.example.test")
+                .unwrap(),
+            1
+        );
+        assert!(
+            !reopened
+                .load_library_rom(origin, 42)
+                .unwrap()
+                .unwrap()
+                .user
+                .favorite_pending
+        );
+
+        reopened
+            .queue_favorite_mutation(origin, 42, true)
+            .expect("a new pending mutation should queue");
+        reopened
+            .clear_pending_favorite_mutations(origin)
+            .expect("local logout cleanup should clear the queue");
+        let restored = reopened
+            .load_library_rom(origin, 42)
+            .unwrap()
+            .expect("cached ROM should remain");
+        assert!(!restored.user.favorite);
+        assert!(!restored.user.favorite_pending);
+
+        reopened
+            .queue_favorite_mutation(origin, 42, true)
+            .expect("terminal replay outcome should have a pending mutation");
+        let discarded = reopened
+            .discard_pending_favorite_mutation(origin, 42, true)
+            .expect("terminal replay outcome should be persisted")
+            .expect("pending mutation should exist");
+        assert_eq!(discarded.rom_id, 42);
+        assert_eq!(reopened.pending_favorite_count(origin).unwrap(), 0);
+        let unavailable = reopened
+            .load_library_rom(origin, 42)
+            .unwrap()
+            .expect("cached ROM should remain as a local record");
+        assert!(!unavailable.user.favorite);
+        assert!(!unavailable.user.favorite_pending);
+        let remote_available = reopened
+            .connection
+            .query_row(
+                "SELECT remote_available FROM library_rom WHERE server_origin = ?1 AND romm_id = ?2",
+                params![origin, 42],
+                |row| row.get::<_, bool>(0),
+            )
+            .unwrap();
+        assert!(!remote_available);
     }
 
     #[test]
@@ -2701,7 +4349,7 @@ mod tests {
             .connection
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .expect("schema version should load");
-        assert_eq!(version, 10);
+        assert_eq!(version, 14);
     }
 
     #[test]
@@ -2744,7 +4392,71 @@ mod tests {
         let version: i64 = connection
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .expect("schema version should load");
-        assert_eq!(version, 10);
+        assert_eq!(version, 14);
+    }
+
+    #[test]
+    fn migration_v14_preserves_duplicate_mapping_rows_as_superseded_history() {
+        let mut connection = Connection::open_in_memory().expect("database should open");
+        connection
+            .execute_batch(INITIAL_SCHEMA)
+            .expect("legacy schema should initialize");
+        connection
+            .execute_batch(
+                r#"ALTER TABLE platform_mapping ADD COLUMN platform_name TEXT NOT NULL DEFAULT '';
+                   ALTER TABLE platform_mapping ADD COLUMN platform_slug TEXT NOT NULL DEFAULT '';
+                   ALTER TABLE platform_mapping ADD COLUMN source TEXT NOT NULL DEFAULT 'custom';
+                   ALTER TABLE platform_mapping ADD COLUMN updated_at_ms INTEGER NOT NULL DEFAULT 0;
+                   ALTER TABLE platform_mapping ADD COLUMN server_origin TEXT NOT NULL DEFAULT '';
+                   INSERT INTO platform_mapping(
+                       id, romm_platform_id, preset_id, preset_version, rom_root,
+                       save_roots_json, state_roots_json, archive_policy, filename_strategy,
+                       enabled, validation_status, custom_fields_json, platform_name,
+                       platform_slug, source, updated_at_ms, server_origin
+                   ) VALUES
+                       ('older', 7, 'emudeck', 1, '/older', '[]', '[]', 'keep',
+                        'romm_filename', 1, 'valid', '{}', 'GBA', 'gba', 'custom', 100,
+                        'https://romm.example.test'),
+                       ('newer', 7, 'emudeck', 2, '/newer', '[]', '[]', 'keep',
+                        'romm_filename', 1, 'valid', '{}', 'GBA', 'gba', 'custom', 200,
+                        'https://romm.example.test');
+                   PRAGMA user_version = 13;"#,
+            )
+            .expect("v13 mapping fixture should initialize");
+
+        run_migrations(&mut connection).expect("v14 migration should succeed");
+        let rows = {
+            let mut statement = connection
+                .prepare(
+                    "SELECT id, enabled, validation_status, superseded FROM platform_mapping ORDER BY id",
+                )
+                .expect("mapping query should prepare");
+            statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, i64>(3)?,
+                    ))
+                })
+                .expect("mapping rows should query")
+                .collect::<Result<Vec<_>, _>>()
+                .expect("mapping rows should load")
+        };
+        assert_eq!(
+            rows,
+            vec![
+                ("newer".to_owned(), 1, "valid".to_owned(), 0),
+                ("older".to_owned(), 0, "superseded".to_owned(), 1),
+            ]
+        );
+        assert_eq!(
+            connection
+                .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+                .expect("schema version should load"),
+            14
+        );
     }
 
     #[test]

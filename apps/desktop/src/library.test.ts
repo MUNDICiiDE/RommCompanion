@@ -3,6 +3,7 @@ import {
   applyRomPage,
   buildDiscoveryQuery,
   createLibraryRequestGate,
+  createPerRomMutationQueue,
   DEFAULT_LIBRARY_FILTERS,
   libraryProgressLabel,
   libraryQueryKey,
@@ -11,6 +12,9 @@ import {
   nextLibrarySort,
   nextLibraryTab,
   queryForLibraryTab,
+  setFavoriteInHomeShelves,
+  setFavoriteInRoms,
+  setRomFavorite,
   shouldAutoLoadLibrary,
   type LibraryCatalogState,
 } from "./library";
@@ -216,5 +220,72 @@ describe("library pagination", () => {
     expect(catalog.nextOffset).toBe(10_000);
     expect(catalog.hasMore).toBe(false);
     expect(elapsedMs).toBeLessThan(2_000);
+  });
+
+  it("updates favorite state immutably across duplicate ROM snapshots", () => {
+    const first = rom(1, "One");
+    const second = rom(2, "Two");
+    const updated = setFavoriteInRoms([first, second], 1, true);
+
+    expect(updated).not.toEqual([first, second]);
+    expect(updated[0].user.favorite).toBe(true);
+    expect(updated[1]).toBe(second);
+    expect(first.user.favorite).toBe(false);
+    expect(setRomFavorite(updated[0], true)).toBe(updated[0]);
+    const queued = setRomFavorite(updated[0], true, true);
+    expect(queued.user.favoritePending).toBe(true);
+    expect(setFavoriteInRoms([queued], 1, false, true)[0]).toMatchObject({
+      user: { favorite: false, favoritePending: true },
+    });
+  });
+
+  it("adds, updates, and removes games from the home favorites shelf", () => {
+    const favorite = setRomFavorite(rom(1, "Existing"), true);
+    const source = rom(2, "New favorite");
+    const shelves = {
+      recent: [source],
+      favorites: [favorite],
+      downloaded: [source],
+      downloads: [] as RomSummary[],
+    };
+
+    const added = setFavoriteInHomeShelves(shelves, source, true, 12);
+    expect(added.favorites.map((item) => item.id)).toEqual([2, 1]);
+    expect(added.recent[0].user.favorite).toBe(true);
+    expect(added.downloaded[0].user.favorite).toBe(true);
+
+    const removed = setFavoriteInHomeShelves(added, source, false, 12);
+    expect(removed.favorites.map((item) => item.id)).toEqual([1]);
+    expect(removed.recent[0].user.favorite).toBe(false);
+
+    const queued = setFavoriteInHomeShelves(removed, source, true, 12, true);
+    expect(queued.favorites[0].user.favoritePending).toBe(true);
+  });
+
+  it("serializes mutations for one ROM while allowing other ROMs to proceed", async () => {
+    const queue = createPerRomMutationQueue();
+    const events: string[] = [];
+    let releaseFirst: () => void = () => undefined;
+    const firstGate = new Promise<void>((resolve) => {
+      releaseFirst = resolve;
+    });
+
+    const first = queue.enqueue(1, async () => {
+      events.push("one:start");
+      await firstGate;
+      events.push("one:end");
+    });
+    const second = queue.enqueue(1, async () => {
+      events.push("one:second");
+    });
+    const other = queue.enqueue(2, async () => {
+      events.push("two:start");
+    });
+
+    await other;
+    expect(events).toEqual(["one:start", "two:start"]);
+    releaseFirst();
+    await Promise.all([first, second]);
+    expect(events).toEqual(["one:start", "two:start", "one:end", "one:second"]);
   });
 });

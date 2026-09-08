@@ -43,14 +43,14 @@ Status meanings: **Complete** has passed its milestone acceptance checks; **In p
 | 1. Application foundation | 1.1 workspace, 1.2 IPC/agent, 1.3 persistence, 1.4 desktop lifecycle, 1.5 foundation validation | Complete | Maintain while later features extend it |
 | 2. Server connection and pairing | 2.1 probing, 2.2 trust controls, 2.3 pairing/manual token, 2.4 validation/persistence, 2.5 recovery/UI, 2.6 validation | Complete | Maintain against supported RomM 5.x releases |
 | 3. Device registration | 3.1 API/local model, 3.2 registration, 3.3 onboarding UI, 3.4 verification/recovery, 3.5 settings/validation | Complete | Maintain while mappings and sync extend the device payload |
-| 4. Controller and spatial navigation | 4.1 native input, 4.2 focus graph, 4.3 action model, 4.4 text entry, 4.5 accessibility/automation, 4.6 physical qualification | In progress | Defer the 4.6 hardware gate; active development continues at Feature 6 |
+| 4. Controller and spatial navigation | 4.1 native input, 4.2 focus graph, 4.3 action model, 4.4 text entry, 4.5 accessibility/automation, 4.6 physical qualification | In progress | Defer the 4.6 physical Windows/Steam Deck controller qualification gate |
 | 5. Onboarding | 5.1 state machine, 5.2 connection/device steps, 5.3 mapping/archive steps, 5.4 agent/update choices, 5.5 resume/validation | Complete | Maintain the completed handoff while library/cache contracts expand |
-| 6. Library browsing | 6.1 API/cache model, 6.2 paged catalog, 6.3 shelves/views, 6.4 search/filter/details, 6.5 offline/error/validation | In progress | Build 6.5 stale/error/artwork handling and complete library performance validation |
-| 7. Favorites | 7.1 model/API, 7.2 optimistic UI, 7.3 offline journal, 7.4 reconciliation/validation | Not started | Begin after library cache contracts stabilize |
-| 8. EmuDeck detection and mappings | 8.1 platform catalog, 8.2 detection, 8.3 mapping editor, 8.4 validation/removable storage, 8.5 persistence/validation | In progress | Complete directory browsing/creation and removable-storage safety in 8.3-8.5 |
+| 6. Library browsing | 6.1 API/cache model, 6.2 paged catalog, 6.3 shelves/views, 6.4 search/filter/details, 6.5 offline/error/validation | Complete | Maintain while favorites and downloads add actions |
+| 7. Favorites | 7.1 model/API, 7.2 optimistic UI, 7.3 offline journal, 7.4 reconciliation/validation | Complete | Maintain while downloads and broader offline controls consume favorite state |
+| 8. EmuDeck detection and mappings | 8.1 platform catalog, 8.2 detection, 8.3 mapping editor, 8.4 validation/removable storage, 8.5 persistence/validation | In progress (8.1-8.4 complete; 8.5 implementation complete) | Defer the 8.5 physical Steam Deck/removable-media qualification gate; development may proceed to 9.1 |
 | 9. Download queue | 9.1 queue model, 9.2 transfer engine, 9.3 controls/concurrency, 9.4 recovery, 9.5 UI/validation | Not started | Begin after mappings provide safe destinations |
 | 10. Archive processing and local copies | 10.1 policy model, 10.2 safe extraction, 10.3 finalization, 10.4 managed removal, 10.5 validation | Not started | Begin after the base download engine |
-| 11. Offline mode and local cache | 11.1 metadata cache, 11.2 artwork LRU, 11.3 offline UX/search, 11.4 reconnect/reset, 11.5 validation | In progress | Extend the 6.1 metadata/page foundation with artwork LRU, offline search, and recovery controls |
+| 11. Offline mode and local cache | 11.1 metadata cache, 11.2 artwork LRU, 11.3 offline UX/search, 11.4 reconnect/reset, 11.5 validation | In progress | Add configurable cache controls, startup enforcement, reconnect convergence, and reset/recovery UI |
 | 12. Background sync agent | 12.1 foreground lifecycle, 12.2 service controls, 12.3 Windows startup, 12.4 SteamOS systemd, 12.5 health/update/validation | In progress | Validate 5.4 registration on Windows and later qualify the SteamOS user service physically |
 | 13. Save and state synchronization | 13.1 mappings/inventory, 13.2 watching/stability, 13.3 protocol engine, 13.4 reconciliation, 13.5 conflicts, 13.6 validation | Not started | Begin after mappings and device registration |
 | 14. Settings and diagnostics | 14.1 settings model/UI, 14.2 staged application, 14.3 diagnostics preview, 14.4 redacted export, 14.5 validation | Not started | Add incrementally as feature settings become available |
@@ -159,6 +159,7 @@ Request only these scopes:
 - `roms.read`
 - `platforms.read`
 - `collections.read`
+- `collections.write`
 - `roms.user.read`
 - `roms.user.write`
 - `assets.read`
@@ -167,6 +168,8 @@ Request only these scopes:
 - `devices.write`
 
 `me.read` is required to verify the authenticated account and inspect the current user's Client API Tokens. The app deliberately does not request `me.write`: signing out clears the local credential and identifies the RomM token for optional revocation in RomM's web interface.
+
+RomM 5.x represents favorites as the authenticated user's private collection marked `is_favorite`, not as a user-ROM property. Favorite reads therefore use `collections.read`; writes use the atomic `POST/DELETE /api/collections/{id}/roms` operations and require `collections.write`. The app creates the private Favorites collection only when the user adds their first favorite and RomM has not created one yet. `roms.user.read` and `roms.user.write` remain required for play-status and future user-ROM operations, but are not used to mutate favorites.
 
 Tokens are kept in Windows Credential Manager or Linux Secret Service. If Linux Secret Service is unavailable, the user may explicitly accept storage in a user-only `0600` credential file. The fallback is never silent.
 
@@ -193,7 +196,7 @@ The default presentation is a media-library layout with large cover art, horizon
 
 All functionality is reachable through controller, keyboard, mouse, and touch. Directional focus is deterministic and restored when dialogs close or virtualized lists update. Motion honors the operating-system reduced-motion preference.
 
-Library API reads use stable, offset-based pages of 48 ROMs. The first page renders immediately, progress is shown as `loaded of total`, and another page is requested within 600 CSS pixels of the scroll end. A controller-focusable **Load more games** action remains available whenever another page exists. Refresh restarts at offset zero and overlapping pages are deduplicated by RomM ROM ID. IPC schema v17 defines typed all, recent, favorite, platform, standard/smart collection, downloaded, and active-download queries plus combinable search, platform, collection, favorite, downloaded, and sort fields and complete game-detail requests. Home and six controller-accessible tabs expose those views; downloaded-only queries never contact RomM. Online discovery translates to RomM's `search_term`, platform, collection, favorite, and ordering parameters; retryable failures immediately query the normalized local cache. The agent persists normalized origin-scoped ROM, user-ROM, artwork, platform, collection, local-state, view-scoped exact-page, and full-detail records in SQLite schema v10. Every remote page, detail record, and metadata snapshot reports live/cache source, refresh time, and 24-hour stale state; only retryable connection/server failures may use remote-cache fallback. Favorite mutation and downloads remain owned by Features 7 and 9.
+Library API reads use stable, offset-based pages of 48 ROMs. The first page renders immediately, progress is shown as `loaded of total`, and another page is requested within 600 CSS pixels of the scroll end. A controller-focusable **Load more games** action remains available whenever another page exists. Refresh restarts at offset zero and overlapping pages are deduplicated by RomM ROM ID. IPC schema v22 defines typed all, recent, favorite, platform, standard/smart collection, downloaded, and active-download queries plus combinable search, platform, collection, favorite, downloaded, sort, complete game-detail, authenticated artwork, authoritative online favorite, durable queued-favorite responses, typed reconnect reconciliation summaries, and local directory browsing/confirmed creation. Home and six controller-accessible tabs expose those views; downloaded-only queries never contact RomM. Online discovery translates to RomM's `search_term`, platform, collection, favorite, and ordering parameters; retryable failures immediately query the normalized local cache. The agent persists normalized origin-scoped ROM, user-ROM, artwork, platform, collection, local-state, view-scoped exact-page, full-detail, and pending favorite records in SQLite schema v13. Artwork is fetched only from the selected RomM origin with the bearer token, validated as a bounded raster image, stored in a fixed 1 GiB LRU for this milestone, and returned to the WebView as a data URL payload. Remote deletion reconciliation removes disposable remote-only rows while preserving downloaded copies as `Unavailable on server`. Every remote page, detail record, and metadata snapshot reports live/cache source, refresh time, and 24-hour stale state; only retryable connection/server failures may use remote-cache fallback. Online favorite persistence, optimistic card/detail controls, per-ROM serialization, authoritative settlement, visible rollback/retry, an origin-scoped coalescing offline journal, and ordered automatic replay after authentication are implemented. Replay refreshes normalized user-ROM state transactionally: `401` and retryable failures preserve and pause the remaining queue, `403` restores rejected optimistic values and identifies `collections.write`, and `404` restores the favorite while marking the remote ROM unavailable. Mapping review can browse the local filesystem without a platform-specific dialog, edit multiple save/state roots, and create only one explicitly confirmed final directory beneath an existing parent. Downloads remain owned by Feature 9.
 
 ### Downloads and local files
 
@@ -280,7 +283,7 @@ The following are explicitly deferred until after v1:
 - Product name: **RomM Companion**, pending a trademark/name check before public release.
 - License: MIT.
 - Server support: one RomM 5.x instance and one active account.
-- Library writes: favorite state only; collections and metadata are read-only.
+- Library writes: favorite membership only, implemented through RomM's special private Favorites collection; user-created collections and metadata remain read-only.
 - Background agent: offered during onboarding and disabled until the user opts in.
 - Sync mode: bidirectional push/pull with `keep_both` conflicts.
 - Reconciliation interval: 15 minutes, plus event-driven and lifecycle-triggered runs.

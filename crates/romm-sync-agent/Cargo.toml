@@ -12,10 +12,13 @@ path = "src/server.rs"
 
 [dependencies]
 anyhow.workspace = true
+base64.workspace = true
 romm-core.workspace = true
 romm-ipc.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 tokio.workspace = true
+uuid.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

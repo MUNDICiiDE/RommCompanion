@@ -2,14 +2,15 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-pub const IPC_SCHEMA_VERSION: u16 = 17;
+pub const IPC_SCHEMA_VERSION: u16 = 24;
 pub const ONBOARDING_STATE_VERSION: u16 = 1;
 
-pub const REQUIRED_SCOPES: [&str; 10] = [
+pub const REQUIRED_SCOPES: [&str; 11] = [
     "me.read",
     "roms.read",
     "platforms.read",
     "collections.read",
+    "collections.write",
     "roms.user.read",
     "roms.user.write",
     "assets.read",
@@ -100,7 +101,19 @@ pub enum AgentRequest {
     SaveMappingDrafts {
         drafts: Vec<PlatformMappingDraft>,
     },
+    BrowseDirectories {
+        path: Option<String>,
+    },
+    CreateDirectory {
+        parent_path: String,
+        name: String,
+        confirmed: bool,
+    },
     ValidateMappings {
+        drafts: Vec<PlatformMappingDraft>,
+        no_platforms: bool,
+    },
+    RecheckMappings {
         drafts: Vec<PlatformMappingDraft>,
         no_platforms: bool,
     },
@@ -124,6 +137,15 @@ pub enum AgentRequest {
     },
     GetGameDetails {
         rom_id: i64,
+    },
+    SetFavorite {
+        rom_id: i64,
+        desired: bool,
+    },
+    GetArtwork {
+        rom_id: i64,
+        preferred_kind: ArtworkKind,
+        refresh: bool,
     },
     GetLibraryMetadata,
     Logout {
@@ -185,6 +207,12 @@ pub enum AgentResponse {
     MappingDrafts {
         drafts: Vec<PlatformMappingDraft>,
     },
+    DirectoryListing {
+        listing: DirectoryListing,
+    },
+    DirectoryCreated {
+        result: DirectoryCreationResult,
+    },
     MappingValidation {
         result: MappingValidationResult,
     },
@@ -208,6 +236,15 @@ pub enum AgentResponse {
     },
     GameDetails {
         details: Box<GameDetails>,
+    },
+    FavoriteUpdated {
+        result: FavoriteMutationResult,
+    },
+    FavoriteQueued {
+        mutation: PendingFavoriteMutation,
+    },
+    Artwork {
+        artwork: Option<Box<ArtworkPayload>>,
     },
     LibraryMetadata {
         metadata: LibraryMetadata,
@@ -240,6 +277,7 @@ pub struct AgentStatus {
     pub ca_id: Option<String>,
     pub http_approved: bool,
     pub device: Option<DeviceIdentity>,
+    pub pending_favorite_count: u64,
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
@@ -329,6 +367,8 @@ pub struct LibraryCollection {
     pub id: i64,
     pub name: String,
     pub kind: CollectionKind,
+    #[serde(default)]
+    pub is_favorite: bool,
     pub rom_ids: Vec<i64>,
     pub rom_count: Option<u64>,
     pub updated_at: Option<String>,
@@ -391,11 +431,38 @@ pub struct MappingValidationIssue {
     pub message: String,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MappingPathStatus {
+    Ready,
+    TemporarilyUnavailable,
+    PermissionDenied,
+    Unsafe,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct MappingPathValidation {
+    pub draft_id: String,
+    pub field: String,
+    pub path: String,
+    pub canonical_path: Option<String>,
+    pub status: MappingPathStatus,
+    pub readable: bool,
+    pub writable: bool,
+    pub available_bytes: Option<u64>,
+    pub removable: bool,
+    pub mounted: bool,
+    pub contains_symlink: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct MappingValidationResult {
     pub valid: bool,
     pub issues: Vec<MappingValidationIssue>,
+    #[serde(default)]
+    pub paths: Vec<MappingPathValidation>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -405,6 +472,45 @@ pub struct MappingDetectionResult {
     pub drafts: Vec<PlatformMappingDraft>,
     pub evidence: Vec<DetectionEvidence>,
     pub detected_count: usize,
+    #[serde(default)]
+    pub preset_updates: Vec<MappingPresetUpdate>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct MappingPresetUpdate {
+    pub draft_id: String,
+    pub platform_id: i64,
+    pub preset_id: String,
+    pub from_version: Option<u16>,
+    pub to_version: u16,
+    pub updated_fields: Vec<String>,
+    pub preserved_custom_fields: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct DirectoryEntry {
+    pub name: String,
+    pub path: String,
+    pub is_symlink: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct DirectoryListing {
+    pub current_path: Option<String>,
+    pub parent_path: Option<String>,
+    pub entries: Vec<DirectoryEntry>,
+    pub locations: bool,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct DirectoryCreationResult {
+    pub path: String,
+    pub created: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -466,6 +572,9 @@ pub struct AuthResult {
     pub account_name: String,
     pub granted_scopes: Vec<String>,
     pub credential_persisted: bool,
+    pub connection_state: ConnectionState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub favorite_reconciliation: Option<FavoriteReconciliationResult>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub warning: Option<String>,
 }
@@ -727,11 +836,22 @@ pub struct ArtworkReference {
     pub cache_key: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ArtworkPayload {
+    pub rom_id: i64,
+    pub cache_key: String,
+    pub mime_type: String,
+    pub data_base64: String,
+    pub source: LibrarySource,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default, rename_all = "camelCase")]
 pub struct UserRomState {
     pub rom_id: i64,
     pub favorite: bool,
+    pub favorite_pending: bool,
     pub backlogged: bool,
     pub hidden: bool,
     pub rating: i64,
@@ -742,6 +862,59 @@ pub struct UserRomState {
     pub updated_at: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct FavoriteMutationResult {
+    pub rom_id: i64,
+    pub requested: bool,
+    pub favorite: bool,
+    pub collection_id: Option<i64>,
+    pub collection_updated_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PendingFavoriteMutation {
+    pub rom_id: i64,
+    pub desired: bool,
+    pub base_favorite: bool,
+    pub base_updated_at: Option<String>,
+    pub queued_at_ms: i64,
+    pub updated_at_ms: i64,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct FavoriteReconciliationResult {
+    pub queued: u64,
+    pub attempted: u64,
+    pub applied: u64,
+    pub discarded: u64,
+    pub remaining: u64,
+    pub outcomes: Vec<FavoriteReconciliationOutcome>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paused_by: Option<AppError>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct FavoriteReconciliationOutcome {
+    pub rom_id: i64,
+    pub desired: bool,
+    pub favorite: bool,
+    pub status: FavoriteReconciliationStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<AppError>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum FavoriteReconciliationStatus {
+    Applied,
+    Discarded,
+    Pending,
+}
+
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum LocalGameStatus {
@@ -749,6 +922,7 @@ pub enum LocalGameStatus {
     RemoteOnly,
     Downloaded,
     MissingLocal,
+    UnavailableOnServer,
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -1176,6 +1350,122 @@ mod tests {
     }
 
     #[test]
+    fn favorite_request_and_authoritative_response_use_the_camel_case_contract() {
+        let request = AgentRequest::SetFavorite {
+            rom_id: 42,
+            desired: true,
+        };
+        assert_eq!(
+            serde_json::to_string(&request).expect("favorite request should serialize"),
+            r#"{"type":"setFavorite","romId":42,"desired":true}"#
+        );
+        let response = AgentResponse::FavoriteUpdated {
+            result: FavoriteMutationResult {
+                rom_id: 42,
+                requested: true,
+                favorite: true,
+                collection_id: Some(3),
+                collection_updated_at: Some("2026-09-04T12:00:00Z".to_owned()),
+            },
+        };
+        let json = serde_json::to_string(&response).expect("favorite response should serialize");
+        assert!(json.contains("\"type\":\"favoriteUpdated\""));
+        assert!(json.contains("\"collectionId\":3"));
+        assert_eq!(
+            serde_json::from_str::<AgentResponse>(&json)
+                .expect("favorite response should deserialize"),
+            response
+        );
+
+        let queued = AgentResponse::FavoriteQueued {
+            mutation: PendingFavoriteMutation {
+                rom_id: 42,
+                desired: false,
+                base_favorite: true,
+                base_updated_at: Some("2026-09-04T12:00:00Z".to_owned()),
+                queued_at_ms: 1_725_451_200_000,
+                updated_at_ms: 1_725_451_260_000,
+            },
+        };
+        let json = serde_json::to_string(&queued).expect("queued favorite should serialize");
+        assert!(json.contains("\"type\":\"favoriteQueued\""));
+        assert!(json.contains("\"baseFavorite\":true"));
+        assert_eq!(
+            serde_json::from_str::<AgentResponse>(&json)
+                .expect("queued favorite should deserialize"),
+            queued
+        );
+
+        let authenticated = AgentResponse::Authenticated {
+            result: AuthResult {
+                server_url: "https://romm.example.test/".to_owned(),
+                token_kind: "client_api_token".to_owned(),
+                token_id: 4,
+                account_id: 7,
+                account_name: "justin".to_owned(),
+                granted_scopes: vec!["collections.read".to_owned()],
+                credential_persisted: true,
+                connection_state: ConnectionState::Connected,
+                favorite_reconciliation: Some(FavoriteReconciliationResult {
+                    queued: 1,
+                    attempted: 1,
+                    applied: 1,
+                    discarded: 0,
+                    remaining: 0,
+                    outcomes: vec![FavoriteReconciliationOutcome {
+                        rom_id: 42,
+                        desired: true,
+                        favorite: true,
+                        status: FavoriteReconciliationStatus::Applied,
+                        error: None,
+                    }],
+                    paused_by: None,
+                }),
+                warning: None,
+            },
+        };
+        let json = serde_json::to_string(&authenticated)
+            .expect("authenticated reconciliation should serialize");
+        assert!(json.contains("\"connectionState\":\"connected\""));
+        assert!(json.contains("\"favoriteReconciliation\""));
+        assert_eq!(
+            serde_json::from_str::<AgentResponse>(&json)
+                .expect("authenticated reconciliation should deserialize"),
+            authenticated
+        );
+    }
+
+    #[test]
+    fn artwork_request_and_response_use_the_versioned_camel_case_contract() {
+        let request = AgentRequest::GetArtwork {
+            rom_id: 42,
+            preferred_kind: ArtworkKind::CoverSmall,
+            refresh: false,
+        };
+        assert_eq!(
+            serde_json::to_string(&request).expect("artwork request should serialize"),
+            r#"{"type":"getArtwork","romId":42,"preferredKind":"cover_small","refresh":false}"#
+        );
+        let response = AgentResponse::Artwork {
+            artwork: Some(Box::new(ArtworkPayload {
+                rom_id: 42,
+                cache_key: "artwork:abc".to_owned(),
+                mime_type: "image/png".to_owned(),
+                data_base64: "iVBORw0KGgo=".to_owned(),
+                source: LibrarySource::Cache,
+            })),
+        };
+        let json = serde_json::to_string(&response).expect("artwork response should serialize");
+        assert!(json.contains("\"type\":\"artwork\""));
+        assert!(json.contains("\"mimeType\":\"image/png\""));
+        assert_eq!(
+            serde_json::from_str::<AgentResponse>(&json)
+                .expect("artwork response should deserialize"),
+            response
+        );
+    }
+
+    #[test]
     fn request_variant_fields_use_camel_case() {
         let request = AgentRequest::Probe {
             base_url: "https://romm.example.test".to_owned(),
@@ -1350,6 +1640,80 @@ mod tests {
                 .expect("frontend-shaped mapping request should deserialize"),
             request
         );
+
+        let detection = AgentResponse::MappingDetection {
+            result: MappingDetectionResult {
+                platforms: vec![PlatformSummary {
+                    id: 7,
+                    name: "Game Boy Advance".to_owned(),
+                    slug: "gba".to_owned(),
+                }],
+                drafts: vec![draft.clone()],
+                evidence: Vec::new(),
+                detected_count: 1,
+                preset_updates: vec![MappingPresetUpdate {
+                    draft_id: draft.id.clone(),
+                    platform_id: 7,
+                    preset_id: "emudeck".to_owned(),
+                    from_version: Some(1),
+                    to_version: 2,
+                    updated_fields: vec!["saveRoots".to_owned()],
+                    preserved_custom_fields: vec!["romRoot".to_owned()],
+                }],
+            },
+        };
+        let detection_json =
+            serde_json::to_string(&detection).expect("mapping detection should serialize");
+        assert!(detection_json.contains(r#""presetUpdates""#));
+        assert!(detection_json.contains(r#""preservedCustomFields":["romRoot"]"#));
+
+        let recheck = AgentRequest::RecheckMappings {
+            drafts: vec![draft],
+            no_platforms: false,
+        };
+        assert!(
+            serde_json::to_string(&recheck)
+                .expect("recheck request should serialize")
+                .contains(r#""type":"recheckMappings""#)
+        );
+
+        assert_eq!(
+            serde_json::to_string(&AgentRequest::BrowseDirectories {
+                path: Some(r"C:\Emulation\roms".to_owned()),
+            })
+            .expect("directory request should serialize"),
+            r#"{"type":"browseDirectories","path":"C:\\Emulation\\roms"}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&AgentRequest::CreateDirectory {
+                parent_path: r"C:\Emulation\roms".to_owned(),
+                name: "gba".to_owned(),
+                confirmed: true,
+            })
+            .expect("directory creation should serialize"),
+            r#"{"type":"createDirectory","parentPath":"C:\\Emulation\\roms","name":"gba","confirmed":true}"#
+        );
+        let response = AgentResponse::DirectoryListing {
+            listing: DirectoryListing {
+                current_path: Some(r"C:\Emulation\roms".to_owned()),
+                parent_path: Some(r"C:\Emulation".to_owned()),
+                entries: vec![DirectoryEntry {
+                    name: "gba".to_owned(),
+                    path: r"C:\Emulation\roms\gba".to_owned(),
+                    is_symlink: false,
+                }],
+                locations: false,
+                truncated: false,
+            },
+        };
+        let json = serde_json::to_string(&response).expect("directory listing should serialize");
+        assert!(json.contains(r#""type":"directoryListing""#));
+        assert!(json.contains(r#""isSymlink":false"#));
+        assert_eq!(
+            serde_json::from_str::<AgentResponse>(&json)
+                .expect("directory listing should deserialize"),
+            response
+        );
     }
 
     #[test]
@@ -1426,6 +1790,7 @@ mod tests {
                 id: 3,
                 name: "Favorites".to_owned(),
                 kind: CollectionKind::Standard,
+                is_favorite: true,
                 rom_ids: vec![42],
                 rom_count: Some(1),
                 updated_at: None,

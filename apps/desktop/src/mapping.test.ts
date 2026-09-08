@@ -1,8 +1,14 @@
 import { describe, expect, it } from "vitest";
 import {
+  addMappingPath,
   cycleArchivePolicy,
   issueForDraft,
+  normalizeMappingPaths,
+  removeMappingPath,
+  updateMappingArchivePolicy,
+  updateMappingEnabled,
   updateMappingPath,
+  updateMappingPathAt,
 } from "./mapping";
 import type { PlatformMappingDraft } from "./types";
 
@@ -38,6 +44,39 @@ describe("mapping review helpers", () => {
       customFields: { saveRoots: true },
     });
     expect(draft.saveRoots).toEqual([]);
+  });
+
+  it("adds, edits, removes, and normalizes multiple optional roots", () => {
+    const added = addMappingPath([draft], draft.id, "saveRoots");
+    const first = updateMappingPathAt(added, draft.id, "saveRoots", 0, " D:\\Saves\\gba ");
+    const secondSlot = addMappingPath(first, draft.id, "saveRoots");
+    const second = updateMappingPathAt(secondSlot, draft.id, "saveRoots", 1, "D:\\Backup\\gba");
+    expect(second[0]?.saveRoots).toEqual([" D:\\Saves\\gba ", "D:\\Backup\\gba"]);
+
+    const removed = removeMappingPath(second, draft.id, "saveRoots", 0);
+    expect(removed[0]?.saveRoots).toEqual(["D:\\Backup\\gba"]);
+    expect(normalizeMappingPaths([
+      { ...removed[0]!, stateRoots: [" ", " D:\\States\\gba "] },
+    ])[0]).toMatchObject({
+      saveRoots: ["D:\\Backup\\gba"],
+      stateRoots: ["D:\\States\\gba"],
+    });
+  });
+
+  it("records enabled and archive choices as preset-protected custom fields", () => {
+    const disabled = updateMappingEnabled([draft], draft.id, false);
+    expect(disabled[0]).toMatchObject({
+      enabled: false,
+      source: "custom",
+      customFields: { enabled: true },
+    });
+
+    const archive = updateMappingArchivePolicy(disabled, draft.id);
+    expect(archive[0]).toMatchObject({
+      archivePolicy: "extract_keep",
+      source: "custom",
+      customFields: { enabled: true, archivePolicy: true },
+    });
   });
 
   it("selects the first issue belonging to a platform", () => {
